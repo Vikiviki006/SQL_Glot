@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Migration specification (schema 5.1.0) -> an Apache SeaTunnel HOCON file and a
 DuckDB validation YAML file.
@@ -8,10 +8,10 @@ specification defines, not only the deterministic value/derived ones.
 
 Input
 -----
-One approved migration-spec.yaml, plus an optional source catalog describing the
+One approved migration-spec-scenario-2-explicit-scn.yaml, plus an optional source catalog describing the
 Oracle tables the specification refers to by wildcard.
 
-    input/migration-spec.yaml        the approved specification (source of truth)
+    input/migration-spec-scenario-2-explicit-scn.yaml        the approved specification (source of truth)
     input/catalog.yaml               optional; required to expand SHOP.* rules
 
 Outputs (all under --output-dir)
@@ -65,7 +65,7 @@ behind.
 Run
 ---
     pip install -r requirements.txt
-    python src/transpiler.py --spec input/migration-spec.yaml --output-dir output
+    python src/transpiler.py --spec input/migration-spec-scenario-2-explicit-scn.yaml --output-dir output
 
     python src/transpiler.py ... --catalog input/catalog.yaml
     python src/transpiler.py ... --self-test
@@ -160,6 +160,19 @@ QUARANTINE_VIEW_PREFIX = "__QUARANTINE__"
 
 #: The specification schema this compiler reads.
 SUPPORTED_SCHEMA_VERSIONS = {"5.0.0", "5.1.0"}
+
+#: The project root, derived from this file's location rather than the working
+#: directory. The three default paths below name things that belong to the
+#: project -- its approved specification, its source catalog, its output folder --
+#: so resolving them against the working directory would make the same command
+#: behave differently depending on where it was typed. An editor that launches the
+#: script with the workspace root as its cwd is the common case, and it is not the
+#: directory the script lives in.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_SPEC = PROJECT_ROOT / "input" / "migration-spec-scenario-2-explicit-scn.yaml"
+DEFAULT_CATALOG = PROJECT_ROOT / "input" / "catalog.yaml"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 
 SEVERITY_ORDER = {"BLOCK": 0, "GOVERNANCE": 1, "ASSUMPTION": 2, "EDGE": 3, "INFO": 4}
 
@@ -600,11 +613,191 @@ class CompileError(Exception):
 # Generic helpers
 # ---------------------------------------------------------------------------
 
+class SpecReadError(Exception):
+    """A specification could not be read as YAML.
+
+    Carries a message written for the person who supplied the file, not for the
+    parser. A YAML scanner error names a line and a column but not the cause: the
+    reader above it has no idea that `#` was typed as `\\#`, and the most common
+    cause of a malformed specification is a copy through a tool that escaped it.
+    """
+
+
+def _describe_yaml_failure(path: Path, text: str, error: "yaml.YAMLError") -> str:
+    """Turn a YAML error into something a person can act on.
+
+    Reports the file, the line, the offending line itself, and -- when the shape
+    of the text matches a known accident -- what to do about it. The three that
+    recur are a tool having escaped the comment marker, non-breaking spaces where
+    indentation belongs, and tabs.
+    """
+    lines = text.splitlines()
+    mark = getattr(error, "problem_mark", None) or getattr(error, "context_mark", None)
+    where = f"{path}"
+    if mark is not None:
+        where = f"{path}, line {mark.line + 1}, column {mark.column + 1}"
+
+    lines_out = [f"{where} is not valid YAML.", ""]
+
+    problem = getattr(error, "problem", None) or str(error).splitlines()[0]
+    lines_out.append(f"  {problem}")
+    context = getattr(error, "context", None)
+    if context:
+        # PyYAML's context already begins with "while", so it is not prefixed here.
+        lines_out.append(f"  {context.rstrip('.')}")
+
+    if mark is not None and 0 <= mark.line < len(lines):
+        offending = lines[mark.line].replace("\t", "<TAB>").replace("\u00a0", "<NBSP>")
+        lines_out.append("")
+        lines_out.append(f"  line {mark.line + 1}: {offending}")
+        lines_out.append("  " + " " * mark.column + "^")
+
+        # When the parser gave up on a comment or a blank line, the line it names
+        # is not the line that is wrong -- the key above the comment is. PyYAML
+        # reports where it stopped, not where it started failing, so showing only
+        # that line points a reader at innocent text.
+        previous = None
+        for index in range(mark.line - 1, -1, -1):
+            candidate = lines[index]
+            if candidate.strip() and not candidate.lstrip().startswith("#"):
+                previous = index
+                break
+        # Only worth showing when it is plausibly the culprit: a line that is
+        # plainly not a key (a list item, say) would only mislead.
+        if previous is not None:
+            above = lines[previous]
+            stripped_above = above.strip()
+            looks_like_broken_key = (
+                ":" not in stripped_above
+                and not stripped_above.startswith("-")
+                and "{" not in stripped_above
+                and "[" not in stripped_above
+            )
+            if looks_like_broken_key:
+                lines_out.append("")
+                lines_out.append("  the line above, which is where a key was expected:")
+                lines_out.append(
+                    f"  line {previous + 1}: "
+                    + above.replace("\t", "<TAB>").replace("\u00a0", "<NBSP>")
+                )
+
+    lines_out.append("")
+    lines_out.append("  If this file was copied through a tool that reformatted it, check for:")
+    lines_out.append("")
+
+    escaped_comments = [i + 1 for i, line in enumerate(lines) if line.lstrip().startswith("\\#")]
+    if escaped_comments:
+        shown = ", ".join(str(n) for n in escaped_comments[:6])
+        more = f" (and {len(escaped_comments) - 6} more)" if len(escaped_comments) > 6 else ""
+        lines_out.append(
+            f"    - {len(escaped_comments)} line(s) begin with an escaped comment marker "
+            f"'\\#' at line {shown}{more}."
+        )
+        lines_out.append("      A backslash before '#' makes it data, not a comment, so the parser")
+        lines_out.append("      reads those lines as a bare scalar with no key. Delete the backslashes.")
+
+    nbsp_lines = [i + 1 for i, line in enumerate(lines) if "\u00a0" in line]
+    if nbsp_lines:
+        total = text.count("\u00a0")
+        shown = ", ".join(str(n) for n in nbsp_lines[:6])
+        more = f" (and {len(nbsp_lines) - 6} more)" if len(nbsp_lines) > 6 else ""
+        lines_out.append(
+            f"    - {total} non-breaking space(s), U+00A0, on line {shown}{more}."
+        )
+        lines_out.append("      YAML indentation must be ordinary spaces. A non-breaking space is not")
+        lines_out.append("      whitespace to the parser, so it becomes part of a key or a value.")
+        lines_out.append("      Replace them with ' ' -- in a code editor, find-and-replace on U+00A0.")
+
+    tab_lines = [i + 1 for i, line in enumerate(lines) if "\t" in line]
+    if tab_lines:
+        shown = ", ".join(str(n) for n in tab_lines[:6])
+        lines_out.append(f"    - tab character(s) used for indentation on line {shown}.")
+        lines_out.append("      YAML forbids tabs in indentation; use spaces.")
+
+    if not (escaped_comments or nbsp_lines or tab_lines):
+        lines_out.append("    - a key on the line above this one is missing its ':', or a value")
+        lines_out.append("      starts where a key was expected. Check the indentation of this line")
+        lines_out.append("      and the one above it.")
+
+    return "\n".join(lines_out)
+
+
 def load_yaml(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        value = yaml.safe_load(handle)
+    """Read a specification, or explain precisely why it could not be read.
+
+    The diagnosis runs *before* parsing so that the known accidents are reported
+    even when the parser's own message points somewhere unhelpful -- which, for an
+    escaped comment marker, is the first such line rather than the real cause.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise
+    except UnicodeDecodeError as exc:
+        raise SpecReadError(
+            f"{path} is not valid UTF-8 ({exc}).\n"
+            "  Re-save it as UTF-8; the specification and the files this produces are UTF-8."
+        ) from None
+
+    lines = text.splitlines()
+    escaped = [i + 1 for i, line in enumerate(lines) if line.lstrip().startswith("\\#")]
+    if escaped:
+        shown = ", ".join(str(n) for n in escaped[:6])
+        more = f" (and {len(escaped) - 6} more)" if len(escaped) > 6 else ""
+        raise SpecReadError(
+            f"{path} is not valid YAML: {len(escaped)} line(s) begin with an escaped "
+            f"comment marker '\\#', at line {shown}{more}.\n"
+            "\n"
+            "  A backslash before '#' makes it an ordinary character, so the parser reads\n"
+            "  those lines as data rather than comments, and then fails on the first of\n"
+            "  them with an unrelated-looking message.\n"
+            "\n"
+            "  Fix: delete the backslashes, so the lines start with '#' again.\n"
+            "  This is what happens when a file is copied through a tool that escapes\n"
+            "  Markdown punctuation."
+        )
+
+    nbsp = text.count("\u00a0")
+    if nbsp:
+        raise SpecReadError(
+            f"{path} is not valid YAML: {nbsp} non-breaking space(s) (U+00A0).\n"
+            "\n"
+            "  YAML indentation must be ordinary spaces; U+00A0 is not whitespace to the\n"
+            "  parser, so it silently becomes part of a key or a value.\n"
+            "\n"
+            "  Fix: replace every U+00A0 with an ordinary space. In an editor, use\n"
+            "  find-and-replace on the character U+00A0 (non-breaking space). A command\n"
+            "  line can do it without typing the character:\n"
+            "      python -c \"import pathlib,sys;p=pathlib.Path(sys.argv[1]);"
+            "p.write_text(p.read_text(encoding='utf-8').replace(chr(0xA0),' '),encoding='utf-8')\" FILE"
+        )
+
+    try:
+        value = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise SpecReadError(_describe_yaml_failure(path, text, exc)) from None
+
     if not isinstance(value, dict):
-        raise ValueError(f"{path}: expected a YAML mapping at the document root")
+        kind = type(value).__name__ if value is not None else "an empty document"
+        extra = ""
+        if isinstance(value, list) and value:
+            first = str(value[0])
+            if isinstance(value[0], dict):
+                extra = (
+                    f"\n  The file looks like a list of sections. A specification is a\n"
+                    f"  mapping of section names, so each of these becomes a key:\n\n"
+                    f"      {first[:90]}\n"
+                )
+        elif value is None or (isinstance(value, str) and not value.strip()):
+            extra = (
+                "\n  The file has no content, or only comments. It needs at least\n"
+                "  `schemaVersion: \"5.1.0\"` and the sections the migration names."
+            )
+        raise SpecReadError(
+            f"{path}: expected a YAML mapping at the document root, found {kind}.\n"
+            "  A specification is a mapping of named sections, so the file must start\n"
+            f"  with a key such as `schemaVersion: \"5.1.0\"` at column zero.{extra}"
+        )
     return value
 
 
@@ -8250,13 +8443,36 @@ def write_artifacts(output_dir: Path, artifacts: Dict[str, Any]) -> List[Path]:
     return written
 
 
-def _load_optional_catalog(spec: Dict[str, Any], explicit: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+def _load_optional_catalog(
+    spec: Dict[str, Any],
+    explicit: Optional[str],
+    spec_path: Optional[Path] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    """The source catalog, from an explicit path, the specification's folder, or nowhere.
+
+    Searched in that order, so a catalog beside the specification wins over a
+    catalog in the project root: compiling `--spec input/other.yaml` should pick
+    up `input/catalog.yaml`, not the root one that belongs to a different
+    specification.
+
+    It is still only an *input*. Without it, wildcard scope cannot be enumerated
+    and the compiler reports that instead of compiling a subset.
+    """
     if explicit:
-        path = Path(explicit)
+        path = Path(explicit).expanduser()
         if not path.is_file():
-            raise FileNotFoundError(f"catalog not found: {path}")
+            raise SpecReadError(
+                f"Catalog not found: {path}\n"
+                "  --catalog was given explicitly, so this is not searched for elsewhere."
+            )
         return load_yaml(path), path
-    for candidate in (Path("input/catalog.yaml"), Path("input/catalog.yml"), Path("catalog.yaml")):
+
+    candidates: List[Path] = []
+    if spec_path is not None:
+        base = spec_path.parent
+        candidates += [base / "catalog.yaml", base / "catalog.yml"]
+    candidates += [DEFAULT_CATALOG, Path("input/catalog.yaml"), Path("catalog.yaml")]
+    for candidate in candidates:
         if candidate.is_file():
             return load_yaml(candidate), candidate
     if spec.get("catalog"):
@@ -8445,7 +8661,22 @@ def _print_findings(title: str, findings: List[Diag], limit: int = 20) -> None:
         print(f"  ... and {len(findings) - limit} more")
     print()
 
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except SpecReadError as exc:
+        # A specification that cannot be read is the reader's problem to fix, not a
+        # crash. One clear paragraph naming the cause beats a scanner traceback.
+        print(f"\n{exc}\n", file=sys.stderr)
+        print("  No output was written.", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"\n  File not found: {exc.filename or exc}\n", file=sys.stderr)
+        return 2
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="transpiler",
         description=(
@@ -8456,14 +8687,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "the source queries they compare against."
         ),
     )
-    parser.add_argument("--spec", default="input/migration-spec.yaml", help="the approved migration specification")
-    parser.add_argument("--output-dir", default="output", help="directory for the generated artifacts")
+    parser.add_argument(
+        "--spec",
+        default=str(DEFAULT_SPEC),
+        help=(
+            "the approved migration specification. Defaults to the project's own "
+            "input/migration-spec-scenario-2-explicit-scn.yaml, so the command behaves the same wherever it "
+            "is run from"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="directory for the two generated files. Defaults to the project's own output/.",
+    )
     parser.add_argument(
         "--catalog",
         default=None,
         help=(
             "source catalog describing the Oracle tables. Required to expand wildcard scope such as "
-            "SHOP.* and wildcard column rules. Defaults to input/catalog.yaml when present."
+            "SHOP.* and wildcard column rules. Defaults to the project's own input/catalog.yaml "
+            "when that file exists."
         ),
     )
     parser.add_argument("--strict", action="store_true", help="exit non-zero when anything blocks the run")
@@ -8473,19 +8717,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.self_test:
         return self_test()
 
-    spec_path = Path(args.spec)
-    output_dir = Path(args.output_dir)
+    spec_path = Path(args.spec).expanduser()
+    output_dir = Path(args.output_dir).expanduser()
 
     if not spec_path.is_file():
-        print(f"specification not found: {spec_path}", file=sys.stderr)
+        print(f"\n  Specification not found: {spec_path}", file=sys.stderr)
+        print(f"  The default is {DEFAULT_SPEC}", file=sys.stderr)
+        print("  Pass --spec to compile a different one.\n", file=sys.stderr)
         return 2
 
     spec = load_yaml(spec_path)
-    try:
-        catalog, catalog_path = _load_optional_catalog(spec, args.catalog)
-    except FileNotFoundError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+    catalog, catalog_path = _load_optional_catalog(spec, args.catalog, spec_path)
 
     result = compile_all(spec, spec_path, catalog, catalog_path)
     result["spec_path"] = str(spec_path)
@@ -8656,7 +8898,58 @@ def self_test() -> int:
         failures += 1
         print(f"        {reparsed}")
 
-    print(f"\nself-test: {len(cases) + 7 - failures}/{len(cases) + 7} passed")
+    # Reading a specification must fail with an explanation, never a traceback.
+    # These three are the accidents that actually happen: a tool escaping the
+    # comment marker, a reformat that left non-breaking spaces, and a genuine
+    # syntax error with nothing to blame.
+    import tempfile
+
+    good = 'schemaVersion: "5.1.0"\nrules:\n  - id: a\n    match: { objectClass: table, schema: S, name: T }\n'
+    cases = [
+        (
+            "an escaped comment marker is named, not left to the parser",
+            good.replace("rules:", "\\# rules:", 1),
+            "escaped comment marker",
+        ),
+        (
+            "non-breaking spaces are named",
+            good.replace("rules:", "\u00a0rules:", 1),
+            "non-breaking space",
+        ),
+        (
+            "a tab in indentation is named",
+            good.replace("  - id: a", "\t- id: a", 1),
+            "tab",
+        ),
+        (
+            "a genuine syntax error still reports the line",
+            good.replace("rules:", "rules", 1),
+            "not valid YAML",
+        ),
+        (
+            "a non-mapping root is rejected with advice",
+            "- a\n- b\n",
+            "mapping at the document root",
+        ),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, text, expected in cases:
+            path = Path(tmp) / "spec.yaml"
+            path.write_text(text, encoding="utf-8")
+            try:
+                load_yaml(path)
+                message = ""
+            except SpecReadError as exc:
+                message = str(exc)
+            except Exception as exc:  # noqa: BLE001
+                message = f"WRONG EXCEPTION {type(exc).__name__}: {exc}"
+            ok = expected in message
+            print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+            if not ok:
+                failures += 1
+                print(f"        expected {expected!r} in: {message[:300] or '<no error raised>'}")
+
+    print(f"\nself-test: {len(cases) + 12 - failures}/{len(cases) + 12} passed")
     return 1 if failures else 0
 
 

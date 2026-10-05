@@ -6,7 +6,7 @@
 # jobs            : 11
 # checks          : 106
 # engine          : duckdb
-# acquisition     : cdc
+# acquisition     : snapshot
 #
 # One job per target relation, in the same order as the SeaTunnel file and under the
 # same job id, so a target relation, its load and its validation can be read together.
@@ -30,7 +30,7 @@
 # ==========================================================================
 duckdb_jobs_version: '1.0'
 produced_by: migration-transpiler 3.0.0
-source_of_truth: input\migration-spec.yaml
+source_of_truth: D:\sqlglot\migration_transpiler_basic_new\migration_transpiler_basic\input\migration-spec-scenario-2-explicit-scn.yaml
 engine:
   name: duckdb
   dialect: duckdb
@@ -42,7 +42,7 @@ convention:
   note: No check names an Oracle relation directly. The runtime exports the source at the pinned SCN and
     attaches the loaded target, and every check compares those views, so a check is comparable across
     jobs and the snapshot is one decision.
-acquisition: cdc
+acquisition: snapshot
 bindings:
   run_scn: RUN_RECORD.oracle_scn
 job:

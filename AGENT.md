@@ -320,6 +320,8 @@ Each of these is a real Oracle→PostgreSQL difference.
 | `SCOPE`/`ACCEPTANCE` field missing | `BLOCK` | `validate_spec` |
 | Catalog for a different schema | ignored with one clear finding | `filter_catalog_to_spec` |
 | A partitioned target needs its `DEFAULT` partition | emitted as a second `CREATE TABLE` | `build_target_ddl` |
+| A specification with `\#`, U+00A0 or tabs | named before parsing, exit 2 | `load_yaml` |
+| A catalog beside a `--spec` elsewhere | that one wins over the project root | `_load_optional_catalog` |
 
 ### The DuckDB translation edge cases
 
@@ -415,9 +417,56 @@ pip install -r requirements.txt
 python src\transpiler.py
 ```
 
-That is the whole run. Defaults are `--spec input/migration-spec.yaml` and
-`--output-dir output`, and `--catalog` is picked up from `input/catalog.yaml`
-when it exists.
+That is the whole run. The defaults are anchored to the **project**, not the
+working directory:
+
+| Default | Value |
+| --- | --- |
+| `--spec` | `PROJECT_ROOT/input/migration-spec.yaml` |
+| `--catalog` | `PROJECT_ROOT/input/catalog.yaml`, if it exists |
+| `--output-dir` | `PROJECT_ROOT/output` |
+
+`PROJECT_ROOT` is derived from `Path(__file__).parent.parent`, not from `cwd`. An
+editor that launches the script with the workspace root as its cwd is the common
+case, and that is not the directory the script lives in — resolving the defaults
+against `cwd` would make the same command behave differently depending on where
+it was typed. A relative path passed explicitly is still relative to `cwd`.
+
+`--catalog` is searched for **beside the specification first**, then the project
+root, then the cwd. Compiling `--spec input/other.yaml` must pick up
+`input/catalog.yaml` rather than the root catalog that belongs to a different
+specification. An explicit `--catalog` is never searched for elsewhere, so a typo
+is reported instead of silently falling back.
+
+## Reading a specification
+
+`load_yaml` raises `SpecReadError`, never a YAML traceback, and `main` prints it
+with exit code 2. Nothing is written on a read failure.
+
+The diagnosis runs **before** parsing. That order is the whole point: PyYAML
+reports where it stopped, which for an escaped comment marker is the first such
+line, not the cause. A reader that only paraphrases the parser would send someone
+to fix line 3 of a 1000-line file.
+
+Recognised without help from the parser:
+
+| Accident | How it is detected |
+| --- | --- |
+| `\#` at the start of a line | the line, stripped, starts with `\#` |
+| U+00A0 anywhere | counted; reported with a one-line command to fix it |
+| tab indentation | reported against the line it is on |
+| root is a list / a scalar / empty | reported with what a specification needs |
+| not UTF-8 | reported by `read_text`, before any parsing |
+
+Anything else falls through to `yaml.safe_load`, and its error is then dressed
+with the file, the line and column, the offending line, a caret, and — when the
+parser named a comment or blank line — the nearest preceding line that looks like
+the key it was expecting. That last part matters: a missing `:` on `rules` makes
+PyYAML blame the comment two lines below it.
+
+All three accidents come from copying a file through a tool that escapes Markdown
+punctuation or reformats indentation. They are the cases worth naming, because
+the parser's own message for each is actively misleading.
 
 ```powershell
 python src\transpiler.py --spec input\other.yaml --catalog input\other-catalog.yaml

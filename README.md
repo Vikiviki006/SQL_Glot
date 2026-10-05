@@ -22,23 +22,65 @@ pip install -r requirements.txt
 python src\transpiler.py
 ```
 
-That is the whole run. `--catalog` is picked up from `input/catalog.yaml` when it
-exists.
+That is the whole run. Works from any directory: the default `--spec`,
+`--catalog` and `--output-dir` resolve against the **project**, not the current
+working directory, so an editor that launches the script with the workspace root
+as its cwd behaves the same as one that launches it from `src/`. An explicit
+relative path you pass is still relative to your cwd, as usual.
+
+Note the package name: `PyYAML`, not `yaml`. There is no PyPI distribution called
+`yaml`, so `pip install yaml` fails.
+
+Any specification works — pass it and go:
 
 ```powershell
-# another specification
+python src\transpiler.py --spec input\migration-spec-scenario-2-explicit-scn.yaml
 python src\transpiler.py --spec input\other.yaml --catalog input\other-catalog.yaml
 
 python src\transpiler.py --strict      # any blocking finding exits non-zero
 python src\transpiler.py --self-test   # dialects and HOCON/YAML, no inputs
 ```
 
+`--catalog` is looked for beside the specification first (`input/catalog.yaml`
+next to whatever `--spec` you passed), then in the project root. If you pass
+`--catalog` explicitly it is not searched for anywhere else, so a typo is
+reported rather than silently ignored.
+
+### When a specification will not read
+
+The compiler reports *why* a file is unreadable rather than showing a YAML
+traceback, and it names the accidents that actually happen:
+
+```text
+input/spec.yaml is not valid YAML: 24 line(s) begin with an escaped comment
+marker '\#', at line 1, 3, 5, 7 (and 20 more).
+
+  A backslash before '#' makes it an ordinary character, so the parser reads
+  those lines as data rather than comments, and then fails on the first of
+  them with an unrelated-looking message.
+
+  Fix: delete the backslashes, so the lines start with '#' again.
+```
+
+It detects escaped comment markers (`\#`), non-breaking spaces (U+00A0) in
+indentation, tabs, a non-mapping document root, non-UTF-8 bytes, and a genuine
+syntax error — for that last one it shows the offending line, a caret, and the
+line above when that is where the key went missing. Nothing is written on a read
+failure, and the exit code is 2.
+
+All three accidents come from a file being copied through a tool that escapes
+Markdown punctuation or reformats indentation. They are the reason the check runs
+*before* parsing: PyYAML reports where it stopped, which for an escaped comment
+is the first such line rather than the cause.
+
 `--catalog` is required whenever the specification names objects by wildcard
 (`SHOP.*`, `ORDERS_20*`, `column: AMOUNT`). Without it those rules cannot be
-enumerated and the compiler says so rather than compiling a subset.
+enumerated and the compiler says so rather than compiling a subset. It is looked
+for beside the specification first, then in the project root.
 
 The compiler exits non-zero if either file fails re-validation, whether or not
-`--strict` is passed.
+`--strict` is passed. It exits 2, with an explanation and no output, when the
+specification cannot be read.
 
 ---
 

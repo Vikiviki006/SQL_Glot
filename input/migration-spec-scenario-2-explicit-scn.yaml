@@ -1,0 +1,996 @@
+# yaml-language-server: $schema=../../schema/migration-spec.schema.json
+
+#
+
+# EVERY FIELD, ONE EASY CASE EACH. A reference specification that fills every
+
+# section and field of schema 5.1.0, and uses all thirteen step categories, on a
+
+# small shop database. Each case is the simplest one that shows the field.
+
+#
+
+# Illustrative: the SHOP schema exists in no estate, so this validates and is
+
+# never run. No build reads 5.x yet (ADR-0096). Fields that exclude each other
+
+# are shown once, with the alternative in a comment next to it.
+
+#
+
+# Operation `parameters` are untyped in 5.0.0 (review gap P4). The names used
+
+# here are the ones the 4.11.0 build reads, where it reads any.
+
+specVersion: 1
+
+schemaVersion: "5.1.0"
+
+dictionaryVersion: 1
+
+# Written as if a tool generated it, so that `authoring` has something to say.
+
+# A specification written by hand omits this block.
+
+authoring:
+
+  tool: spec-assistant 0.4.1
+
+  generatedAt: "2026-09-29T09:00:00Z"
+
+  inferred:
+
+    - defaults.collation
+
+    - rules[0].steps[0].targetType
+
+  reviewed:
+
+    by: lead data architect
+
+    at: "2026-09-29T11:00:00Z"
+
+    covers: [defaults.collation]
+
+engines:
+
+  source: { engine: oracle,     version: "19" }
+
+  target: { engine: postgresql, version: "17" }
+
+# The tables that move. Every table in SHOP except the import staging tables.
+
+scope:
+
+  include:
+
+    - { objectClass: table, schema: SHOP, name: "*" }
+
+  exclude:
+
+    - { objectClass: table, schema: SHOP, name: "TMP_*" }
+
+defaults:
+
+  emptyStringIsNull: "null"                        # quoted: the string, not YAML null
+
+  charLengthSemantics: characters
+
+  collation: binary
+
+  numberWithoutPrecision: from-profile
+
+  dateWithTimeComponent: date-if-profile-proves-no-time
+
+  timestampWithTimeZone: split-offset              # keeps the offset in <column>_offset
+
+  fractionalSecondsBeyondMicroseconds: round
+
+  json: jsonb
+
+# Every value state the schema knows, so no transport may drop any of them.
+
+fidelityFloor:
+
+  - "NULL"
+
+  - EMPTY_LOB
+
+  - HIGH_PRECISION
+
+  - SUB_SECOND
+
+  - TZ_OFFSET                                      # reachable through split-offset above
+
+  - BINARY
+
+  - TRAILING_WHITESPACE
+
+  - UNICODE_NORMALISATION
+
+rules:
+
+  # --- column recipes, in place -------------------------------------------
+
+  # value: cast. Every AMOUNT column becomes money. An override below widens one.
+
+  - id: amounts-are-money
+
+    match: { objectClass: column, schema: SHOP, name: "*", column: AMOUNT }
+
+    steps:
+
+      - { category: value, operation: cast, targetType: "numeric(12,2)", onOverflow: quarantine }
+
+  # value: trim.
+
+  - id: branch-code-is-trimmed
+
+    match: { objectClass: column, schema: SHOP, name: BRANCH, column: CODE }
+
+    steps:
+
+      - { category: value, operation: trim, parameters: { side: both } }
+
+  # value: trim and substring, AND a rename, in one recipe. The steps run in
+
+  # order on COUNTRY, then the result lands under the new name and type.
+
+  # Written as two recipes, a rename and a substring, they would compete for
+
+  # the same column and only one would apply.
+
+  - id: country-becomes-country-code
+
+    match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: COUNTRY }
+
+    target: { column: country_code, type: "char(2)", onOverflow: quarantine }
+
+    steps:
+
+      - { category: value, operation: trim }
+
+      - { category: value, operation: substring, parameters: { from: 1, length: 2 } }
+
+  # value: mask. The sensitive block below requires this recipe.
+
+  - id: email-is-masked
+
+    match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: EMAIL }
+
+    steps:
+
+      - { category: value, operation: mask, parameters: { strategy: hash } }
+
+  # value: default-when-null.
+
+  - id: currency-defaults-to-eur
+
+    match: { objectClass: column, schema: SHOP, name: ORDERS, column: CURRENCY }
+
+    steps:
+
+      - { category: value, operation: default-when-null, parameters: { value: EUR } }
+
+  # value: date-add. The old system stored ship dates one day early.
+
+  - id: ship-date-off-by-one
+
+    match: { objectClass: column, schema: SHOP, name: ORDERS, column: SHIP_DATE }
+
+    steps:
+
+      - { category: value, operation: date-add, parameters: { days: 1 } }
+
+  # value: drop. The column does not reach the target.
+
+  - id: fax-is-dropped
+
+    match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: LEGACY_FAX }
+
+    steps:
+
+      - { category: value, operation: drop }
+
+  # structural: drop-column. The sensitive block below requires this recipe.
+
+  - id: old-phone-is-dropped
+
+    match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: PHONE_OLD }
+
+    steps:
+
+      - { category: structural, operation: drop-column }
+
+  # escape, as scalar SQL: the one rule the vocabulary cannot say.
+
+  - id: priority-from-amount
+
+    match: { objectClass: column, schema: SHOP, name: ORDERS, column: PRIORITY }
+
+    steps:
+
+      - category: escape
+
+        language: sql-scalar
+
+        body: "CASE WHEN AMOUNT > 1000 THEN 'HIGH' ELSE 'NORMAL' END"
+
+        declaredInputs: [AMOUNT]
+
+        degradation:
+
+          cdcSafety: unsafe-snapshot-only
+
+          validation: execute-both-sides-and-compare
+
+          acknowledgedBy: lead data architect
+
+  # A rename is a target and no steps.
+
+  - id: status-is-renamed
+
+    match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: STATUS }
+
+    target: { column: status_code }
+
+  # Every target field a column recipe can carry: a new name, a declared type
+
+  # with its overflow answer, NOT NULL, and a failure answer.
+
+  - id: created-becomes-created-on
+
+    match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: CREATED }
+
+    target:
+
+      column: created_on
+
+      type: date
+
+      nullable: false
+
+      onOverflow: quarantine
+
+      onFailure: quarantine
+
+  # --- column recipes that produce a new column ---------------------------
+
+  # derived: concat, after trimming each input. `input` trims a working
+
+  # column in place; the concat writes the recipe's own column.
+
+  - id: full-name
+
+    match: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+    target: { column: full_name, type: "varchar(160)", onOverflow: fail-run, onFailure: "null" }
+
+    steps:
+
+      - { category: value, operation: trim, input: FIRST_NAME }
+
+      - { category: value, operation: trim, input: LAST_NAME }
+
+      - category: derived
+
+        operation: concat
+
+        inputs: [FIRST_NAME, LAST_NAME]
+
+        parameters: { separator: " " }
+
+  # derived: coalesce. The first phone number that exists.
+
+  - id: contact-phone
+
+    match: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+    target: { column: contact_phone, onFailure: "null" }
+
+    steps:
+
+      - { category: derived, operation: coalesce, inputs: [MOBILE, LANDLINE] }
+
+  # derived: case-when. A label from a one-letter code.
+
+  - id: status-label
+
+    match: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+    target: { column: status_label, type: "varchar(20)", onOverflow: fail-run, onFailure: "null" }
+
+    steps:
+
+      - category: derived
+
+        operation: case-when
+
+        inputs: [STATUS]
+
+        parameters:
+
+          cases: [{ when: "A", then: active }, { when: "C", then: closed }]
+
+          else: unknown
+
+  # derived: arithmetic. Quantity times unit price.
+
+  - id: line-total
+
+    match: { objectClass: table, schema: SHOP, name: ORDER_LINE }
+
+    target: { column: line_total, type: "numeric(14,2)", onOverflow: fail-run, onFailure: fail-run }
+
+    steps:
+
+      - category: derived
+
+        operation: arithmetic
+
+        inputs: [QTY, UNIT_PRICE]
+
+        parameters: { operator: multiply }
+
+  # value: regexp-extract, reading NARRATIVE with `from` and keeping it.
+
+  - id: order-reference
+
+    match: { objectClass: table, schema: SHOP, name: ORDERS }
+
+    target: { column: order_ref, type: "varchar(11)", onOverflow: fail-run, onFailure: "null" }
+
+    steps:
+
+      - category: value
+
+        operation: regexp-extract
+
+        from: NARRATIVE
+
+        parameters: { pattern: "ORD-[0-9]{6}", group: 0 }
+
+  # structural: add-column, from a generated value.
+
+  - id: loaded-at
+
+    match: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+    target: { column: loaded_at, type: timestamptz, onOverflow: fail-run, onFailure: fail-run }
+
+    steps:
+
+      - { category: structural, operation: add-column, valueSource: { generated: loaded-at } }
+
+  # structural: add-column, from a constant.
+
+  - id: tenant-id
+
+    match: { objectClass: table, schema: SHOP, name: ORDERS }
+
+    target: { column: tenant_id, type: "varchar(10)", onOverflow: fail-run, onFailure: fail-run }
+
+    steps:
+
+      - { category: structural, operation: add-column, valueSource: { constant: shop-eu } }
+
+  # --- table recipes: one per table, steps in order -----------------------
+
+  # row-selection with allOf, column-split, and change-aware, on one table.
+
+  # The table is renamed on the way: SHOP.CUSTOMER lands as shop.client.
+
+  # Every column recipe on CUSTOMER above follows it there, so STATUS arrives
+
+  # as shop.client.status_code and CREATED as shop.client.created_on.
+
+  - id: customer-table
+
+    match: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+    target: { schema: shop, table: client }
+
+    steps:
+
+      # Nested (5.1.0, ADR-0097): not closed AND (recent OR a VIP).
+
+      - category: row-selection
+
+        predicate:
+
+          allOf:
+
+            - { column: STATUS, comparison: ne, literal: X }
+
+            - anyOf:
+
+                - { column: CREATED, comparison: ge, literal: "2020-01-01 00:00:00" }
+
+                - { column: VIP, comparison: eq, literal: "Y" }
+
+      # Splits FULL_ADDRESS ("street, city"). `column` is required from 5.1.0:
+
+      # 5.0.0 had no field for it, a defect found by writing this file.
+
+      - category: column-split
+
+        operation: delimiter
+
+        column: FULL_ADDRESS
+
+        parameters: { delimiter: ", ", onExtraParts: quarantine }
+
+        targets:
+
+          - { name: street, targetType: "varchar(120)" }
+
+          - { name: city,   targetType: "varchar(80)" }
+
+      - category: change-aware
+
+        operation: propagate-if-changed
+
+        columns: [EMAIL, STATUS]
+
+  # row-selection with anyOf and a column comparison, then a lookup.
+
+  - id: orders-table
+
+    match: { objectClass: table, schema: SHOP, name: ORDERS }
+
+    steps:
+
+      - category: row-selection
+
+        predicate:
+
+          anyOf:
+
+            - { column: SHIP_DATE, comparison: ge, comparisonColumn: ORDER_DATE }
+
+            - { column: SHIP_DATE, comparison: is-null }
+
+      - category: lookup
+
+        from: SHOP.BRANCH
+
+        using: [BRANCH_CODE]
+
+        onKey: [CODE]
+
+        take:
+
+          - { column: NAME, as: branch_name, targetType: "varchar(80)" }
+
+        cardinality: at-most-one
+
+        onMiss: { behaviour: default, value: UNKNOWN }
+
+        maxLookupRows: 1000
+
+        volatility: static
+
+  # A filter on a computed value (5.1.0, ADR-0098): the column recipe
+
+  # `line-total` produces line_total, and column recipes run first.
+
+  - id: lines-with-value
+
+    match: { objectClass: table, schema: SHOP, name: ORDER_LINE }
+
+    steps:
+
+      - category: row-selection
+
+        predicate: { column: line_total, comparison: gt, literal: 0 }
+
+  # key-declaration. The audit table has no primary key.
+
+  - id: audit-key
+
+    match: { objectClass: table, schema: SHOP, name: AUDIT_EVENT }
+
+    steps:
+
+      - category: key-declaration
+
+        columns: [EVENT_ID]
+
+        origin: unique-index
+
+        stability: immutable                       # required under cdc
+
+  # set: keep the latest price per product.
+
+  - id: latest-price
+
+    match: { objectClass: table, schema: SHOP, name: PRICE_HISTORY }
+
+    steps:
+
+      - category: set
+
+        operation: deduplicate
+
+        sql: >
+          SELECT * FROM (
+            SELECT p.*, ROW_NUMBER() OVER (
+                     PARTITION BY PRODUCT_ID ORDER BY CHANGED_AT DESC) rn
+            FROM SHOP.PRICE_HISTORY p)
+          WHERE rn = 1
+        cdcHandling: snapshot-only
+
+        orderSensitive:
+
+          orderBy: [CHANGED_AT]
+
+          tieBreak: [PRODUCT_ID]
+
+  # cardinality: merge two yearly tables into one.
+
+  - id: orders-history
+
+    match: { objectClass: table, schema: SHOP, name: "ORDERS_20*" }
+
+    target: { table: orders_history }
+
+    steps:
+
+      - category: cardinality
+
+        operation: merge
+
+        sources: [SHOP.ORDERS_2023, SHOP.ORDERS_2024]
+
+        correspondence:
+
+          key: [ORDER_ID]
+
+          discriminator: ORDER_YEAR
+
+          generated: none
+
+  # cardinality: split one party table into people and companies.
+
+  - id: party-split
+
+    match: { objectClass: table, schema: SHOP, name: PARTY }
+
+    steps:
+
+      - category: cardinality
+
+        operation: split
+
+        targets: [person, company]
+
+        correspondence:
+
+          key: [PARTY_ID]
+
+          discriminator: PARTY_TYPE
+
+  # relational: products joined to their category.
+
+  - id: product-catalogue
+
+    match: { objectClass: table, schema: SHOP, name: PRODUCT }
+
+    target: { table: product_catalogue }
+
+    steps:
+
+      - category: relational
+
+        operation: denormalise
+
+        grain:
+
+          columns: [product_id]
+
+          uniqueness: asserted
+
+        from:
+
+          driving: SHOP.PRODUCT
+
+          joins:
+
+            - relation: SHOP.CATEGORY
+
+              type: inner
+
+              joinOn: [{ drivingColumn: CATEGORY_ID, relationColumn: CATEGORY_ID }]
+
+        columns:
+
+          - { fromRelation: SHOP.PRODUCT,  fromColumn: PRODUCT_ID, toColumn: product_id, targetType: "numeric(10,0)" }
+
+          - { fromRelation: SHOP.PRODUCT,  fromColumn: NAME,       toColumn: product_name, targetType: "varchar(120)" }
+
+          - { fromRelation: SHOP.CATEGORY, fromColumn: TITLE,      toColumn: category_title, targetType: "varchar(80)" }
+
+        droppedFromSource: [SHOP.CATEGORY.CREATED_BY]
+
+        referentialIntegrity: abandoned-by-design
+
+        cdcFanOut:
+
+          handling: snapshot-only
+
+          # Deprecated in 5.1.0 and removed at the next major: fan-out is work,
+
+          # not a correctness ceiling (ADR-0099). Shown because it is still valid.
+
+          maxRowsPerSourceChange: 500
+
+          reason: >
+            A change to one CATEGORY row rewrites every product in it, and there
+            is no per-row CDC form for a join.
+        validation: digest-over-the-join
+
+  # pivot: stock per warehouse becomes one column per warehouse.
+
+  - id: stock-by-product
+
+    match: { objectClass: table, schema: SHOP, name: STOCK }
+
+    target: { table: stock_by_product }
+
+    steps:
+
+      - category: pivot
+
+        "on": WAREHOUSE                            # quoted: YAML reads bare on as true
+
+        grain: [PRODUCT_ID]
+
+        aggregate: { operation: sum, column: QTY }
+
+        intoColumns:
+
+          - { sourceValue: NORTH, targetColumn: qty_north, targetType: "numeric(10,0)" }
+
+          - { sourceValue: SOUTH, targetColumn: qty_south, targetType: "numeric(10,0)" }
+
+        onUnlistedValue: quarantine
+
+  # escape, as set SQL, for a summary the vocabulary cannot say.
+
+  - id: daily-summary
+
+    match: { objectClass: table, schema: SHOP, name: ORDER_SUMMARY }
+
+    steps:
+
+      - category: escape
+
+        language: sql-set
+
+        body: "SELECT ORDER_DATE, SUM(AMOUNT) AS TOTAL FROM SHOP.ORDERS GROUP BY ORDER_DATE"
+
+        degradation:
+
+          cdcSafety: unsafe-snapshot-only
+
+          validation: none-accepted
+
+          acknowledgedBy: lead data architect
+
+overrides:
+
+  # Beats `amounts-are-money` for this one table, whatever the specificity.
+
+  - id: orders-amount-is-wider
+
+    match: { objectClass: column, schema: SHOP, name: ORDERS, column: AMOUNT }
+
+    steps:
+
+      - { category: value, operation: cast, targetType: "numeric(14,4)", onOverflow: fail-run }
+
+objectPolicies:
+
+  # translate, with nothing beyond the definition to preserve.
+
+  - match: { objectClass: index, schema: SHOP, name: "*" }
+
+    carry: translate
+
+    behaviourContract: { mustPreserve: [none], evidence: definition-diff }
+
+  - match: { objectClass: constraint-primary-key, schema: SHOP, name: "*" }
+
+    carry: translate
+
+    behaviourContract: { mustPreserve: [none], evidence: definition-diff }
+
+  - match: { objectClass: constraint-foreign-key, schema: SHOP, name: "*" }
+
+    carry: translate
+
+    behaviourContract:
+
+      mustPreserve: [cascade-on-delete]
+
+      evidence: execute-both-sides-and-compare
+
+  # translate, where the behaviour is the position, not the definition.
+
+  - match: { objectClass: sequence, schema: SHOP, name: ORDER_SEQ }
+
+    carry: translate
+
+    behaviourContract:
+
+      mustPreserve: [sequence-position]
+
+      evidence: execute-both-sides-and-compare
+
+  # reimplement-in-target, built after its sequence.
+
+  - match: { objectClass: trigger, schema: SHOP, name: ORDERS_BI }
+
+    carry: reimplement-in-target
+
+    behaviourContract:
+
+      mustPreserve: [sequence-position]
+
+      evidence: execute-both-sides-and-compare
+
+    dependsOn:
+
+      - object: { objectClass: sequence, schema: SHOP, name: ORDER_SEQ }
+
+        kind: build
+
+  # translate, where two triggers must keep their firing order.
+
+  - match: { objectClass: trigger, schema: SHOP, name: CUSTOMER_AU }
+
+    carry: translate
+
+    behaviourContract:
+
+      mustPreserve: [firing-order]
+
+      evidence: execute-both-sides-and-compare
+
+    dependsOn:
+
+      - object: { objectClass: trigger, schema: SHOP, name: CUSTOMER_AU_FIRST }
+
+        kind: ordering
+
+  # translate, for a view that reads another object's data.
+
+  - match: { objectClass: view, schema: SHOP, name: ACTIVE_CUSTOMERS }
+
+    carry: translate
+
+    behaviourContract: { mustPreserve: [none], evidence: execute-both-sides-and-compare }
+
+    dependsOn:
+
+      - object: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+        kind: data
+
+  # translate, for row-level security, compared per principal below.
+
+  - match: { objectClass: rls-policy, schema: SHOP, name: CUSTOMER_REGION }
+
+    carry: translate
+
+    behaviourContract:
+
+      mustPreserve: [row-visibility]
+
+      evidence: execute-both-sides-and-compare
+
+  # relocate-to-application, with the loss named and signed.
+
+  - match: { objectClass: package, schema: SHOP, name: BILLING_PKG }
+
+    carry: relocate-to-application
+
+    behaviourContract:
+
+      mustPreserve: [transactional-independence]
+
+      evidence: not-established
+
+      acknowledgedLoss:
+
+        properties: [transactional-independence]
+
+        reason: >
+          Billing moves into the application, which owns its transaction
+          boundaries from cutover.
+
+        acknowledgedBy: lead data architect
+
+  # drop-deliberately, attested by a person.
+
+  - match: { objectClass: trigger, schema: SHOP, name: OLD_AUDIT_TRG }
+
+    carry: drop-deliberately
+
+    behaviourContract: { mustPreserve: [none], evidence: operator-attests }
+
+  # blocked-no-path: a user-defined type PostgreSQL has no equivalent for.
+
+  - match: { objectClass: type, schema: SHOP, name: ADDRESS_T }
+
+    carry: blocked-no-path
+
+    behaviourContract: { mustPreserve: [none], evidence: operator-attests }
+
+targetPhysical:
+
+  - match: { objectClass: table, schema: SHOP, name: ORDERS }
+
+    tablespace: orders_data
+
+    partition:
+
+      strategy: range
+
+      columns: [order_date]
+
+      sourceStrategy: INTERVAL
+
+    constraint:
+
+      deferrable: true
+
+      initiallyDeferred: true
+
+sensitive:
+
+  # A column of password hashes: carried unchanged, never logged.
+
+  - match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: PASSWORD_HASH }
+
+    class: secret
+
+    handling: keep
+
+  # Masked by the recipe `email-is-masked`.
+
+  - match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: EMAIL }
+
+    class: personal
+
+    handling: mask
+
+  # Dropped by the recipe `old-phone-is-dropped`.
+
+  - match: { objectClass: column, schema: SHOP, name: CUSTOMER, column: PHONE_OLD }
+
+    class: personal
+
+    handling: drop
+
+acceptance:
+
+  # Every table gets these.
+
+  checks: [row-count-exact, chunk-digest-match, no-orphan-keys, referential-integrity, quarantine-empty]
+
+  maxQuarantinedRows: 10
+
+  # A base aggregateTolerance applies only when the base runs aggregate-match,
+
+  # so it is set on the stricter entry that does.
+
+  stricter:
+
+    # The money table: exact totals, and nothing held back.
+
+    - match: { objectClass: table, schema: SHOP, name: ORDERS }
+
+      checks: [aggregate-match]
+
+      maxQuarantinedRows: 0
+
+      aggregateTolerance:
+
+        value: 0.01
+
+        reason: Legacy totals were rounded per line; finance accepts one cent.
+
+    # The table behind the row-level security policy.
+
+    - match: { objectClass: table, schema: SHOP, name: CUSTOMER }
+
+      checks: [behaviour-equivalence]
+
+  principals:
+
+    - source: SHOP_OWNER
+
+      target: shop_owner
+
+      note: Owns CUSTOMER. Oracle applies the policy to the owner; PostgreSQL needs FORCE ROW LEVEL SECURITY.
+
+    - source: SHOP_READER
+
+      target: shop_reader
+
+sourceImpact:
+
+  maxConcurrentSessions: 4
+
+  maxLogicalReadsPerSecond: 100000
+
+governance:
+
+  requiresApproval:
+
+    - lossy-cast
+
+    - declared-key
+
+    - accepted-assumption
+
+    - behaviour-not-preserved
+
+    - object-dropped
+
+    - tolerance-above-zero
+
+# SCENARIO 2: point-in-time snapshot using an explicit Oracle SCN.
+#
+# The migration reads the Oracle source as it existed at one exact SCN.
+# The transpiler can use this value when generating source queries such as:
+#   SELECT ... FROM SHOP.CUSTOMER AS OF SCN :run_scn
+#
+# This scenario is useful when we need a reproducible, consistent snapshot
+# instead of continuously following changes with CDC.
+
+run:
+
+  shape: migration
+
+  acquisition: snapshot
+
+  processing: bounded
+
+  rerun: restart
+
+  capture:
+
+    reader: logminer
+
+    startPosition: explicit-scn
+
+    scn: 123456789
+
+  # The SCN above represents the Oracle point-in-time boundary.
+
+  # Alternative incremental mode is intentionally kept as documentation:
+  # watermark:
+  #   column: ORDER_ID
+  #   strategy: monotonic-key
+  #   detectsDeletes: false
+  #   lateArrival: { handling: overlap-window, windowKeys: 1000 }
+
+naming:
+
+  schema:
+
+    policy: map                                    # mirror, or flatten with flattenInto
+
+    map:
+
+      - { source: SHOP, target: shop }
+
+  case: lower
+
+  onReservedOrSpecial: quote
+
+  onTooLong: shorten-with-hash
+
+  packageMembers: prefix
