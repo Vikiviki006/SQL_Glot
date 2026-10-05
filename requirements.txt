@@ -1,0 +1,13 @@
+# Runtime dependencies for the transpiler.
+#
+# DuckDB is deliberately absent: the compiler generates the validation jobs and
+# proves every statement in them parses, but it executes nothing. Execution is the
+# DuckDB runner's job, against real source and target snapshots. tools/verify_duckdb.py
+# is an optional developer harness and needs duckdb installed separately; nothing
+# in src/ imports it.
+PyYAML>=6.0
+sqlglot>=28.6
+
+# Do not install the optional `sqlglot[c]` compiled build while working on the
+# project-local ctunnel / pgcontract dialects: SQLGlot documents limitations with
+# runtime subclassed dialects in that mode.
