@@ -1,2 +1,7 @@
-.venv
-migration_transpiler_basic_new\migration_transpiler_basic\output
+.venv/
+__pycache__/
+*.pyc
+
+# Generated artifacts. Every file here is reproducible from the specification, and
+# a diff of two ~100KB generated files is noise on every recompile.
+output/

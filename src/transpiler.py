@@ -1,76 +1,3 @@
-﻿#!/usr/bin/env python3
-"""
-Migration specification (schema 5.1.0) -> an Apache SeaTunnel HOCON file and a
-DuckDB validation YAML file.
-
-This is the *advanced* compiler. It implements every step category the
-specification defines, not only the deterministic value/derived ones.
-
-Input
------
-One approved migration-spec-scenario-2-explicit-scn.yaml, plus an optional source catalog describing the
-Oracle tables the specification refers to by wildcard.
-
-    input/migration-spec-scenario-2-explicit-scn.yaml        the approved specification (source of truth)
-    input/catalog.yaml               optional; required to expand SHOP.* rules
-
-Outputs (all under --output-dir)
---------------------------------
-    output/seatunnel.conf       ONE SeaTunnel HOCON file: for every target
-                                     relation a <schema>_<table>_ddl job and a
-                                     <schema>_<table>_data job, each carrying the
-                                     source query, the target query, the DDL or DML
-                                     commands, and schema_save_mode
-    output/duckdb.yaml          ONE DuckDB YAML file: the validation rules the
-                                     specification implies, plus the compiled
-                                     query for each of them in DuckDB, plus the
-                                     source queries they compare against
-
-There is no orchestrator, no scheduler and no separate report. The two files are
-handed to two runners; nothing else decides when anything runs, and nothing else
-records what the compiler found -- the findings go to stdout.
-
-Pipeline
---------
-    spec --validate--> diagnostics
-          |
-          v
-    rule resolution -> column plan -> SQL stages (cTunnel/Oracle dialect)
-          |
-          +--> cTunnel query        (read Oracle, pinned by AS OF SCN)
-          +--> target PostgreSQL DDL (pgcontract dialect) -> ddl / dml commands
-          +--> SeaTunnel HOCON file  (the artifact sent to SeaTunnel)
-          +--> DuckDB YAML file      (ctunnel -> duckdb rewrite, proven to bind)
-          |
-          v
-    validate_query -> validate_source_query -> validate_target_query
-        -> validate_seatunnel_query -> validate_duckdb_query -> finalize
-
-Dialects
---------
-Two project-local SQLGlot dialects are registered, alongside DuckDB's own:
-
-    ctunnel    = Oracle      reads the Oracle source; keeps AS OF SCN
-    pgcontract = Postgres    writes target DDL; keeps the spec's type names
-    duckdb     = built-in    runs the validation checks. Oracle functions are
-                              rewritten explicitly, and one that cannot be is a
-                              BLOCK rather than a plan that fails mid-run.
-
-Both are registered into ``sqlglot.Dialect.classes`` so ``read=``/``dialect=``
-work by name. Every generated artifact is proven by
-parse -> generate -> parse -> generate byte-identity before it is written, and
-every DuckDB statement is additionally proven to leave no Oracle-only function
-behind.
-
-Run
----
-    pip install -r requirements.txt
-    python src/transpiler.py --spec input/migration-spec-scenario-2-explicit-scn.yaml --output-dir output
-
-    python src/transpiler.py ... --catalog input/catalog.yaml
-    python src/transpiler.py ... --self-test
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -170,7 +97,7 @@ SUPPORTED_SCHEMA_VERSIONS = {"5.0.0", "5.1.0"}
 #: directory the script lives in.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_SPEC = PROJECT_ROOT / "input" / "migration-spec-scenario-2-explicit-scn.yaml"
+DEFAULT_SPEC = PROJECT_ROOT / "input" / "hr-spec.yaml"
 DEFAULT_CATALOG = PROJECT_ROOT / "input" / "catalog.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 
@@ -953,6 +880,12 @@ class CatalogTable:
     primary_key: List[str] = field(default_factory=list)
     unique_indexes: List[List[str]] = field(default_factory=list)
     profile: Dict[str, Any] = field(default_factory=dict)
+    # True when the shape came from a specification rule's own `columns:` rather
+    # than from a catalog extracted from Oracle. The shape is identical either way,
+    # so nothing downstream branches on it -- but a reader of the artifacts does
+    # need to know which one they are looking at, because only the second is
+    # evidence about the actual database.
+    from_spec: bool = False
 
     def column(self, name: str) -> Optional[CatalogColumn]:
         upper = str(name).upper()
@@ -1017,8 +950,14 @@ def parse_catalog(spec: Dict[str, Any], catalog: Optional[Dict[str, Any]], sourc
     raw_tables: List[Dict[str, Any]] = []
     if catalog:
         raw_tables = list(catalog.get("tables") or [])
-    elif spec.get("catalog"):
-        raw_tables = list((spec.get("catalog") or {}).get("tables") or [])
+    else:
+        # `spec.catalog` is either an inline mapping of tables or the name of a
+        # file to read, which `_load_optional_catalog` resolves. Only the inline
+        # form carries tables here; a string is a path, and treating it as a
+        # mapping would fail on the very field that was just made legal.
+        inline = spec.get("catalog")
+        if isinstance(inline, dict):
+            raw_tables = list(inline.get("tables") or [])
 
     tables: List[CatalogTable] = []
     for raw in raw_tables:
@@ -3648,6 +3587,10 @@ def plan_jobs(spec: Dict[str, Any], catalog: Catalog, naming: Naming, diags: Dia
     # because the scope wildcard did not reach it.
     candidates: List[Tuple[str, str]] = []
     seen: set = set()
+    #: target relation -> the source that claimed it, for collision detection.
+    targets_claimed: Dict[Tuple[str, str], str] = {}
+    #: candidates dropped by scope.exclude, counted for the empty-plan finding.
+    excluded_keys: set = set()
 
     def add(schema: str, table: str) -> None:
         key = (schema.upper(), table.upper())
@@ -3681,6 +3624,17 @@ def plan_jobs(spec: Dict[str, Any], catalog: Catalog, naming: Naming, diags: Dia
             continue
         add(str(schema), str(name))
 
+    # A rule names exactly what it applies to, so an exact match is authoritative
+    # even when the catalog does not list the relation. That is what lets a
+    # specification migrate a table the catalog has no metadata for -- the columns
+    # become assumptions, recorded in the file, rather than the whole table
+    # disappearing from the migration.
+    #
+    # It also means a rule naming a typo produces a job. That is the correct
+    # trade: the specification is the source of truth, and the missing catalog
+    # entry is reported as an assumption on that job, not silently used as a reason
+    # to drop what was asked for.
+
     for schema, table in sorted(candidates):
         excluded = any(
             entry.get("objectClass") == "table"
@@ -3689,6 +3643,7 @@ def plan_jobs(spec: Dict[str, Any], catalog: Catalog, naming: Naming, diags: Dia
             for entry in excludes
         )
         if excluded:
+            excluded_keys.add((schema, table))
             diags.add(
                 "TABLE_EXCLUDED_BY_SCOPE",
                 "EDGE",
@@ -3711,6 +3666,26 @@ def plan_jobs(spec: Dict[str, Any], catalog: Catalog, naming: Naming, diags: Dia
         target_schema, target_table = resolve_target(spec, naming, schema, table)
         table_rules = table_rules_for(spec, schema, table)
         base = f"{schema}_{table}".replace("-", "_").replace(".", "_").lower()
+
+        # Two sources resolving to one target is a collision, not a merge. A merge
+        # is declared as a `cardinality/merge` step naming its sources; a wildcard
+        # scope that maps several relations onto the same `target.table` is not one,
+        # and without this check the last job planned silently overwrites the
+        # earlier ones in the same .conf -- three sources, one target, one load.
+        claimed = targets_claimed.get((target_schema.upper(), target_table.upper()))
+        if claimed is not None:
+            diags.add(
+                "TARGET_COLLISION",
+                "BLOCK",
+                f"{schema}.{table} resolves to {target_schema}.{target_table}, which "
+                f"{claimed} also resolves to. Two relations cannot become one target: one of them "
+                "would overwrite the other on load. Either give each a distinct `target.table`, or "
+                "declare a `cardinality/merge` step naming both sources, which is how several "
+                "relations are meant to land in one target",
+                table=f"{schema}.{table}",
+            )
+        else:
+            targets_claimed[(target_schema.upper(), target_table.upper())] = f"{schema}.{table}"
 
         split_step = _find_step(table_rules, "cardinality", "split")
         if split_step is not None:
@@ -3839,6 +3814,47 @@ def plan_jobs(spec: Dict[str, Any], catalog: Catalog, naming: Naming, diags: Dia
                 merge_step=merge_step,
                 label="merge of several sources",
             )
+        )
+
+    # ------------------------------------------------------------------------
+    # An empty plan is either correct or a bug, and the two must be told apart.
+    #
+    # `jobs: 0` is the worst output this compiler can produce: it looks like a
+    # migration that has nothing to do, rather than a migration that could not be
+    # resolved. So when the scope and the rules *did* name objects and no job
+    # appeared, that is a defect in the planner and is reported as one.
+    #
+    # The test is deliberately narrow: something the specification named, or the
+    # catalog resolved, produced no job. A specification that genuinely migrates
+    # nothing is not an error, and must stay silent.
+    # ------------------------------------------------------------------------
+
+    if not plans and candidates:
+        # Candidates exist and every one was dropped. Each drop already reported
+        # itself -- TABLE_EXCLUDED_BY_SCOPE or TABLE_CONSUMED_BY_MERGE -- so this is
+        # not an unexplained loss, and `jobs: 0` is the truthful answer. What is
+        # still missing is the *net* statement: a reader of two empty files cannot
+        # tell "nothing matched" from "everything matched and was then discarded",
+        # and those need different responses.
+        excluded_n = len(excluded_keys)
+        consumed_n = len(consumed)
+        lost = ", ".join(f"{schema}.{table}" for schema, table in sorted(candidates)[:10])
+        more = (
+            f" (+{len(candidates) - 10} more)" if len(candidates) > 10 else ""
+        )
+        diags.add(
+            "PLANNER_EMPTY_RESULT",
+            "BLOCK",
+            f"scope and rules resolved {len(candidates)} relation(s) -- {lost}{more} -- but "
+            f"plan_jobs produced no job for any of them"
+            + (f": {excluded_n} excluded by scope" if excluded_n else "")
+            + (f", {consumed_n} consumed as merge sources" if consumed_n else "")
+            + (". Nothing was migrated, and the two empty files on their own say nothing "
+               "about why. Each relation is named in the finding above it"
+               if (excluded_n or consumed_n) else
+               ". No relation was excluded or consumed, so they were dropped for a reason "
+               "this planner does not record. That is a defect in the planner, not a "
+               "specification with nothing to do"),
         )
 
     return plans
@@ -4013,7 +4029,31 @@ def compile_job(
     # Base source.
     # ------------------------------------------------------------------
     primary_schema, primary_table = plan.sources[0]
-    primary_catalog = catalog.get(primary_schema, primary_table)
+
+    # The table describing the source relation, whether that came from a catalog
+    # file or from the rule's own `columns:` list -- `merge_inline_source_tables`
+    # has already put both in the same place, so this one lookup answers either.
+    # `None` is still legitimate here: a rule that names no column at all leaves
+    # the projection below with nothing to work from, and it is there that the
+    # difference between "the rules named the columns" and "nothing named them"
+    # can actually be told apart.
+    primary_table_meta: Optional[CatalogTable] = catalog.get(primary_schema, primary_table)
+
+    if primary_table_meta is not None and primary_table_meta.from_spec:
+        note = (
+            f"the column list for {primary_schema}.{primary_table} comes from this specification's "
+            "own `columns:`, not from Oracle. It is what the migration is written against, so a "
+            "column added to or dropped from the source table after this was written will not be "
+            "reflected here; extract a catalog and recompile to re-read the real shape"
+        )
+        diags.add(
+            "SOURCE_SHAPE_FROM_SPEC",
+            "ASSUMPTION",
+            note,
+            rule_id=_rule_id_of(plan.table_rules, None),
+            table=f"{primary_schema}.{primary_table}",
+        )
+        assumptions.append(note)
 
     declared_key = _declared_key(plan, diags)
 
@@ -4246,15 +4286,51 @@ def compile_job(
     elif pivot_step is not None:
         pass  # built below
     else:
-        base_columns = (
-            list(primary_catalog.columns)
-            if primary_catalog is not None
-            # Without a catalog the specification is the only statement of what
-            # exists. A synthesised column keeps the two branches uniform and
-            # records that its type is unknown, rather than silently dropping
-            # every column the spec did not name.
-            else [CatalogColumn(name=name, oracle_type="") for name in _spec_named_columns(spec, plan)]
-        )
+        # Two ways to know the source's columns, in the order they are trusted.
+        #
+        # A catalog is authoritative. A table rule's own `columns:` is the next best
+        # thing, being the spec stating the shape outright. Failing both, the only
+        # columns there are to project are the ones the spec's own steps name --
+        # enough for a rule-driven table, and never enough for a plain one, which is
+        # why that case is blocked below rather than quietly narrowed.
+        if primary_table_meta is not None:
+            base_columns = list(primary_table_meta.columns)
+        else:
+            named = _spec_named_columns(spec, plan)
+            base_columns = [CatalogColumn(name=name, oracle_type="") for name in named]
+            if not base_columns:
+                diags.add(
+                    "SOURCE_SHAPE_UNKNOWN",
+                    "BLOCK",
+                    f"nothing describes the columns of {primary_schema}.{primary_table}, so there "
+                    "is no projection to compile and this job would load nothing. Either give the "
+                    "table rule a `columns:` list, or supply a catalog for the source schema -- "
+                    "see need_catalog.md for which to choose",
+                    rule_id=_rule_id_of(plan.table_rules, None),
+                    table=f"{primary_schema}.{primary_table}",
+                )
+                job.status = "BLOCKED"
+                return job
+            shape_note = (
+                f"no catalog describes {primary_schema}.{primary_table}, so the projection covers "
+                f"only the {len(base_columns)} column(s) this specification's own rules name "
+                f"({sorted(c.name for c in base_columns)}). Any column the rules never mention is "
+                "not migrated, and no type is known for these, so the target column type comes "
+                "from the rules that touch it"
+            )
+            diags.add(
+                "SOURCE_SHAPE_FROM_RULES",
+                "ASSUMPTION",
+                shape_note,
+                rule_id=_rule_id_of(plan.table_rules, None),
+                table=f"{primary_schema}.{primary_table}",
+            )
+            # Into the artifacts, not just the diagnostic list. A reader of
+            # seatunnel.conf or duckdb.yaml is the person who needs to know a
+            # projection is narrower than the table, and that reader only has the
+            # file.
+            assumptions.append(shape_note)
+
         for catalog_column in base_columns:
             if str(catalog_column.name).upper() in recipe_columns:
                 continue
@@ -4337,7 +4413,7 @@ def compile_job(
         match = rule.get("match") or {}
         source_column_name = str(match.get("column"))
         target = rule.get("target") or {}
-        catalog_column = primary_catalog.column(source_column_name) if primary_catalog else None
+        catalog_column = primary_table_meta.column(source_column_name) if primary_table_meta else None
 
         # A rename-only rule and a transform rule can both name this column; the
         # rename contributes the target name and type, the transform the value.
@@ -4499,7 +4575,7 @@ def compile_job(
                         target.get("type"),
                         rule_id,
                         f"{primary_schema}.{primary_table}.{name}",
-                        primary_catalog.column(name) if primary_catalog else None,
+                        primary_table_meta.column(name) if primary_table_meta else None,
                     )
                     operations.append({"operation": f"value/{operation}", "rule_id": rule_id})
                 else:
@@ -4526,7 +4602,7 @@ def compile_job(
                 register(
                     naming.identifier(str(target_column), "column"),
                     expression,
-                    target.get("type") or _infer_derived_type(operation, names, primary_catalog, rule_id, diags),
+                    target.get("type") or _infer_derived_type(operation, names, primary_table_meta, rule_id, diags),
                     rule_id,
                     f"{primary_schema}.{primary_table} derived",
                     None,
@@ -4708,7 +4784,7 @@ def compile_job(
                 None,
                 None,
                 "pivot-grain",
-                primary_catalog.column(column) if primary_catalog else None,
+                primary_table_meta.column(column) if primary_table_meta else None,
             )
             group_by.append(ref(column))
         for name, expression, type_sql in pivot_columns:
@@ -4815,7 +4891,7 @@ def compile_job(
         operations.append({"operation": "cardinality/split", "value": value})
 
     # A watermark predicate, when the run is query-incremental.
-    watermark = _watermark_predicate(spec, ref, primary_catalog, diags, plan)
+    watermark = _watermark_predicate(spec, ref, primary_table_meta, diags, plan)
     if watermark:
         predicates.append(watermark)
         watermark_column = str((spec.get("run") or {}).get("watermark", {}).get("column") or "")
@@ -5013,6 +5089,114 @@ def _declared_key(plan: JobPlan, diags: Diagnostics) -> List[str]:
                 if str(column) not in keys:
                     keys.append(str(column))
     return keys
+
+
+def _inline_source_tables(spec: Dict[str, Any]) -> List[CatalogTable]:
+    """Every source relation whose shape a table rule declares inline.
+
+    A table rule may state what its own relation contains:
+
+        rules:
+          - id: orders-table
+            match:   { objectClass: table, schema: HR, name: ORDERS }
+            target:  { schema: public, table: orders }
+            columns:
+              - { name: ORDER_ID, type: "NUMBER(10)", nullable: false }
+            primaryKey: [ORDER_ID]
+
+    That is the specification being self-sufficient: the shape the compiler needs is
+    right here, so no catalog is needed. The shape is identical to a catalog entry,
+    so the two are interchangeable and a rule reads the same either way.
+
+    `columns:` describes the relation being migrated **from** -- the rule's `match`,
+    not the target it lands in. A rule matching `HR.ORDERS` says what HR.ORDERS
+    contains, whatever the target is called.
+
+    Several rules may match one table; their column lists concatenate in rule order
+    and de-duplicate by name, because a later rule declaring a column the earlier one
+    already declared is refining it, not adding a second one. `primaryKey:` entries
+    accumulate the same way.
+
+    A rule matching a wildcard schema is skipped: it describes every table it
+    matched, so its columns cannot be attributed to one relation without a catalog
+    to say what that relation is.
+    """
+    by_relation: Dict[Tuple[str, str], CatalogTable] = {}
+    order: List[Tuple[str, str]] = []
+
+    for rule in ordered_rules(spec):
+        match = rule.get("match") or {}
+        if str(match.get("objectClass") or "") != "table":
+            continue
+        schema = str(match.get("schema") or "")
+        name = str(match.get("name") or "")
+        if not schema or not name or "*" in schema or "*" in name:
+            continue
+
+        declared = rule.get("columns") or []
+        keys = [str(k) for k in rule.get("primaryKey") or []]
+        if not declared and not keys:
+            continue
+
+        relation = (schema.upper(), name.upper())
+        table = by_relation.get(relation)
+        if table is None:
+            table = CatalogTable(schema=schema, name=name, columns=[], from_spec=True)
+            by_relation[relation] = table
+            order.append(relation)
+
+        seen = {c.name.upper() for c in table.columns}
+        for entry in declared:
+            if isinstance(entry, str):
+                column = CatalogColumn(name=entry)
+            elif isinstance(entry, dict):
+                column = CatalogColumn(
+                    name=str(entry.get("name") or ""),
+                    oracle_type=str(entry.get("type") or entry.get("oracleType") or ""),
+                    nullable=bool(entry.get("nullable", True)),
+                    char_semantics=str(entry.get("charSemantics") or "characters"),
+                )
+            else:
+                continue
+            if not column.name or column.name.upper() in seen:
+                continue
+            seen.add(column.name.upper())
+            table.columns.append(column)
+
+        known = {k.upper() for k in table.primary_key}
+        for key in keys:
+            if key and key.upper() not in known:
+                known.add(key.upper())
+                table.primary_key.append(key)
+
+    return [by_relation[relation] for relation in order if by_relation[relation].columns]
+
+
+def merge_inline_source_tables(catalog: Catalog, spec: Dict[str, Any]) -> Catalog:
+    """Fold each table rule's own `columns:` list into the catalog.
+
+    This is what lets a specification be compiled with no catalog file at all: the
+    shapes it needs are stated in the specification, and from here on nothing
+    downstream can tell the difference -- the key check, the watermark and the type
+    inference all read the same catalog either way. The synthesised tables are
+    marked `from_spec`, which is how a job knows to say where its shape came from.
+
+    The catalog wins per relation. A catalog is extracted from Oracle and is
+    therefore authoritative; the inline list exists so a specification can be
+    compiled without one, not so it can overrule one. A stale hand-written list
+    silently governing a migration is worse than a redundant one.
+    """
+    inline = _inline_source_tables(spec)
+    if not inline:
+        return catalog
+
+    merged = list(catalog.tables)
+    for table in inline:
+        if catalog.get(table.schema, table.name) is not None:
+            continue
+        merged.append(table)
+
+    return Catalog(tables=merged, source=catalog.source)
 
 
 def _spec_named_columns(spec: Dict[str, Any], plan: JobPlan) -> List[str]:
@@ -6093,6 +6277,13 @@ def build_seatunnel_conf(
             + ", ".join(job.job_id for job in blocked)
         )
         lines.append("# A blocked job is never emitted as a partial guess.")
+        # Which job failed for which reason. Without this the header names the
+        # absence and withholds its cause, and the cause is the only part that
+        # tells anyone what to change.
+        for job in blocked:
+            reasons = [d for d in job.diagnostics.items if d.severity == "BLOCK"]
+            for reason in reasons:
+                lines.append(f"#   {job.job_id}: {reason.code} -- {reason.message}")
     lines.append(HEADER)
     lines.append("")
     lines.append("job {")
@@ -8316,6 +8507,21 @@ def _fk_between(entry: Dict[str, Any], job: CompiledJob) -> bool:
 # Compiler driver
 # ---------------------------------------------------------------------------
 
+def output_folder_name(spec_path: Path) -> str:
+    """The folder one specification's output goes in, named after its own file.
+
+    Two specifications produce two folders, so neither can overwrite the other.
+    Derived from the stem rather than typed, so `foo.yaml` and `foo.yml` cannot
+    land in one folder and silently replace each other.
+
+    Only the stem is used, so `hr/hr-spec.yaml` and `shop/hr-spec.yaml` still
+    collide. That is deliberate: two specifications of the same name need
+    distinguishing names, and inventing a suffix silently would make the output
+    path depend on a rule nobody was told.
+    """
+    return spec_path.stem
+
+
 def compile_all(
     spec: Dict[str, Any],
     spec_path: Path,
@@ -8326,6 +8532,9 @@ def compile_all(
     spec_diags = Diagnostics()
     parsed_catalog = parse_catalog(spec, catalog, str(catalog_path) if catalog_path else "")
     parsed_catalog = filter_catalog_to_spec(parsed_catalog, spec, spec_diags)
+    # After filtering, so the shapes a rule states are scoped exactly as the catalog
+    # was, and before anything reads the catalog, so every reader sees one shape.
+    parsed_catalog = merge_inline_source_tables(parsed_catalog, spec)
     naming = Naming(spec, spec_diags)
 
     validate_spec(spec, parsed_catalog, spec_diags)
@@ -8428,6 +8637,14 @@ def _duckdb_header(
                 "# A blocked job is never emitted as a partial guess.",
             ]
         )
+        # Which job failed for which reason -- the cause is what tells a reader
+        # what to change, and this file is the only place they will look.
+        for job in jobs:
+            if job.job_id not in blocked:
+                continue
+            for reason in job.diagnostics.items:
+                if reason.severity == "BLOCK":
+                    lines.append(f"#   {job.job_id}: {reason.code} -- {reason.message}")
     lines.append("=" * 74)
     return lines
 
@@ -8452,11 +8669,18 @@ def _load_optional_catalog(
 
     Searched in that order, so a catalog beside the specification wins over a
     catalog in the project root: compiling `--spec input/other.yaml` should pick
-    up `input/catalog.yaml`, not the root one that belongs to a different
+    up its own catalog, not the root one that belongs to a different
     specification.
 
-    It is still only an *input*. Without it, wildcard scope cannot be enumerated
-    and the compiler reports that instead of compiling a subset.
+    A specification can also name its own catalog with a top-level ``catalog:``
+    key, and that is checked **before** any file search. Without it a project
+    holding several specifications -- `hr-spec.yaml` beside `catalog_hr.yaml`,
+    say -- needs every invocation to repeat `--catalog`, and forgetting it produces
+    zero columns and therefore a blocked job, with the real cause one command-line
+    flag away.
+
+    It is still only an *input*. Without one, a wildcard scope cannot be
+    enumerated and the compiler reports that rather than compiling a subset.
     """
     if explicit:
         path = Path(explicit).expanduser()
@@ -8467,26 +8691,61 @@ def _load_optional_catalog(
             )
         return load_yaml(path), path
 
+    # A catalog the specification declares for itself. Resolved relative to the
+    # specification when it is a bare filename, so `catalog: catalog_hr.yaml`
+    # means the file beside the specification.
+    declared = spec.get("catalog")
+    if isinstance(declared, dict) and declared.get("tables"):
+        return declared, None
+    if isinstance(declared, str) and declared:
+        declared_path = Path(declared).expanduser()
+        if not declared_path.is_absolute() and spec_path is not None:
+            beside = spec_path.parent / declared_path
+            if beside.is_file():
+                declared_path = beside
+        if declared_path.is_file():
+            return load_yaml(declared_path), declared_path
+        raise SpecReadError(
+            f"Catalog not found: {declared_path}\n"
+            f"  spec.catalog names `{declared}`, so it is not searched for elsewhere."
+        )
+
     candidates: List[Path] = []
     if spec_path is not None:
         base = spec_path.parent
-        candidates += [base / "catalog.yaml", base / "catalog.yml"]
+        # `catalog.yaml`, then `<spec-stem>_catalog.yaml`, then
+        # `catalog_<spec-stem>.yaml`. The last two let a project keep one catalog
+        # per specification without either naming it in the spec or repeating
+        # --catalog on every command line.
+        candidates += [
+            base / "catalog.yaml",
+            base / "catalog.yml",
+            base / f"{spec_path.stem}_catalog.yaml",
+            base / f"catalog_{spec_path.stem}.yaml",
+        ]
     candidates += [DEFAULT_CATALOG, Path("input/catalog.yaml"), Path("catalog.yaml")]
     for candidate in candidates:
         if candidate.is_file():
             return load_yaml(candidate), candidate
-    if spec.get("catalog"):
-        return {"tables": (spec.get("catalog") or {}).get("tables")}, None
     return None, None
 
 
 def catalog_schemas(spec: Dict[str, Any]) -> set:
-    """Every schema the specification mentions, so a foreign catalog is ignored.
+    """Every *concrete* schema the specification mentions, so a foreign catalog is ignored.
 
     Auto-discovering `input/catalog.yaml` is convenient, but a catalog for SHOP
     applied to an HR specification produces a wall of "table not found" findings
     that look like broken rules and are actually a mismatched input. Filtering by
     schema turns that into one clear diagnostic.
+
+    A wildcard is **not** a schema, so it is not collected. This is the whole
+    reason a catalog survives when the specification says `schema: "*"`: a
+    wildcard scope means every schema the catalog has, and collecting the literal
+    text `"*"` as a wanted name would leave the set as `{"*"}`, match no real
+    schema, and throw the entire catalog away — leaving the planner with nothing
+    to enumerate and the run silently empty. An empty result here means "no
+    schema is named concretely, so the catalog is not filtered", which is what a
+    wildcard scope intends.
     """
     schemas: set = set()
     for entry in (spec.get("scope") or {}).get("include") or []:
@@ -8500,7 +8759,7 @@ def catalog_schemas(spec: Dict[str, Any]) -> set:
             schema = (rule.get("match") or {}).get("schema")
             if schema and "*" not in str(schema):
                 schemas.add(str(schema).upper())
-    return schemas
+    return {schema for schema in schemas if "*" not in schema}
 
 
 def filter_catalog_to_spec(catalog: Catalog, spec: Dict[str, Any], diags: Diagnostics) -> Catalog:
@@ -8536,130 +8795,59 @@ def filter_catalog_to_spec(catalog: Catalog, spec: Dict[str, Any], diags: Diagno
 
 
 def summarize(result: Dict[str, Any], output_dir: Path, written: List[Path]) -> None:
-    """Print everything the compile-report.yaml used to hold.
+    """Print what was produced, and nothing else.
 
-    There is no report file, so this is the only record of what the compiler
-    found. It is printed in severity order and grouped by job, and it is not
-    truncated silently: where a list is cut off, the remainder is counted so a
-    reader knows it exists.
+    The console is a receipt, not a report. Whether a rule compiled, what a
+    blocking finding said, which assumptions were made and which value states were
+    handled are questions the specification's owner answers -- by running the checks
+    in `duckdb.yaml`, not by reading compiler output. So this reports the files,
+    their sizes and the job counts, and stops.
+
+    The one thing it will not do is stay silent about a *generated file* that failed
+    to re-validate. That is a statement about the compiler's own output rather than
+    about the specification, and shipping a file it could not read back is exactly
+    the failure mode both files exist to prevent.
     """
     jobs: List[CompiledJob] = result["jobs"]
-    spec_diags: Diagnostics = result["diagnostics"]
-    naming: Naming = result["naming"]
+    plans: List[DuckDBJob] = result["duckdb_plans"]
     validation = result["validation"]
     duckdb_validation = result["duckdb_validation"]
-    plans: List[DuckDBJob] = result["duckdb_plans"]
-    run = (result.get("spec") or {}).get("run") or {}
-
-    ready = [job for job in jobs if job.query is not None]
-    blocked = [job for job in jobs if job.query is None]
-    blocking = spec_diags.blocking + [d for job in jobs for d in job.diagnostics.blocking]
-    governance = spec_diags.of("GOVERNANCE") + [
-        d for job in jobs for d in job.diagnostics.of("GOVERNANCE")
-    ]
-    assumptions = [d for job in jobs for d in job.diagnostics.of("ASSUMPTION")]
-    edges = [d for job in jobs for d in job.diagnostics.of("EDGE")]
+    runnable = len([job for job in jobs if job.query is not None])
 
     print(f"{TOOL_NAME} {TOOL_VERSION}")
-    print(f"spec                 : {result.get('spec_path')}")
-    print(f"catalog              : {result.get('catalog_path') or 'none supplied'} "
-          f"({len(result['catalog'].tables)} table(s))")
-    print(f"acquisition          : {run.get('acquisition') or '-'}")
     print()
-    print("ARTIFACTS")
-    print(f"  seatunnel.conf      {len(ready)} target relation(s) -> "
-          f"{result['seatunnel_jobs']} jobs (ddl + data each)")
-    print(f"  duckdb.yaml         {len(plans)} job(s), {result['duckdb_checks']} validation rule(s) "
-          f"({sum(1 for dj in plans for c in dj.checks if c.get('sql'))} with runnable SQL, "
-          f"{sum(1 for dj in plans for c in dj.checks if not c.get('sql'))} runtime-strategy only)")
-    print(f"  re-validated        seatunnel {'PASS' if validation['ok'] else 'FAIL'} "
-          f"({validation['queries_reparsed']} queries re-parsed from the file) | "
-          f"duckdb {'PASS' if duckdb_validation['ok'] else 'FAIL'} "
-          f"({duckdb_validation['checks_reparsed']} statements re-parsed from the file)")
+    print("  spec        : " + str(result.get("spec_path")))
+    print(f"  catalog     : {result.get('catalog_path') or 'none supplied'}"
+          f" ({len(result['catalog'].tables)} table(s))")
+    print("  output      : " + str(output_dir))
     print()
-
-    print("COVERAGE")
-    print(f"  jobs                : {len(ready)} ready, {len(blocked)} blocked")
-    print(f"  target columns      : {sum(len(job.columns) for job in jobs)}")
-    print(f"  blocking findings   : {len(blocking)}")
-    print(f"  governance findings : {len(governance)}")
-    print(f"  assumptions         : {len(assumptions)}")
-    print(f"  edge cases handled  : {len(edges)}")
-    if blocked:
-        print(f"  blocked jobs        : {', '.join(job.job_id for job in blocked)}")
+    print(f"  {SEATUNNEL_CONF_NAME:<15}{result['seatunnel_jobs']:>3} jobs"
+          f"   {sum(len(job.columns) for job in jobs):>3} columns   "
+          f"{_size(written, SEATUNNEL_CONF_NAME)}")
+    print(f"  {DUCKDB_JOBS_NAME:<15}{len(plans):>3} jobs"
+          f"   {result['duckdb_checks']:>3} checks   "
+          f"{_size(written, DUCKDB_JOBS_NAME)}")
     print()
+    print(f"  {runnable} of {len(jobs)} target relations compiled")
 
-    _print_findings("BLOCKING  -- the run must not proceed", blocking)
-    _print_findings("GOVERNANCE  -- a human must sign off", governance)
-    _print_findings("ASSUMPTION  -- a deterministic choice someone should confirm", assumptions)
-    _print_findings("EDGE  -- handled and reported for audit", edges)
-
-    quoted = naming.quoted_names()
-    shortened = naming.shortened_names()
-    if quoted or shortened:
-        print("NAMING APPLIED")
-        for name in quoted:
-            print(f"  quoted              : {name}")
-        for name in shortened:
-            print(f"  shortened w/ hash   : {name}")
+    failed = [
+        failure["problem"]
+        for report in (validation, duckdb_validation)
+        for failure in report.get("failures") or []
+    ]
+    if failed:
         print()
+        print(f"  {len(failed)} statement(s) did not survive re-validation:")
+        for problem in failed[:10]:
+            print(f"    - {problem}")
 
-    print("JOBS")
-    for job in jobs:
-        status = "blocked" if job.query is None else "ready"
-        operations = ", ".join(str(op.get("operation")) for op in job.operations) or "-"
-        print(f"  [{status:>7}] {job.job_id}  ->  {job.target['schema']}.{job.target['table']}")
-        print(f"            source        : {', '.join(s['relation'] for s in job.sources)}")
-        print(f"            operations    : {operations}")
-        print(f"            columns       : {len(job.columns)}"
-              + (f"  key: {', '.join(job.primary_keys)}" if job.primary_keys else "  key: none"))
-        if job.snapshot_only:
-            print(f"            snapshot-only : yes")
-        if job.upsert:
-            print(f"            write mode    : upsert on {', '.join(job.primary_keys) or 'no key'}")
-        if job.quarantine_filters:
-            sentinels = ", ".join(str(q.get("column")) for q in job.quarantine_filters)
-            print(f"            quarantine    : {sentinels}")
-        if job.ddl.get("statements"):
-            print(f"            ddl           : "
-                  f"{', '.join(str(s.get('name')) for s in job.ddl['statements'])}")
-        if job.assumptions:
-            print(f"            assumptions   : {job.assumptions[0]}"
-                  + (f" (+{len(job.assumptions) - 1} more)" if len(job.assumptions) > 1 else ""))
-    print()
 
-    if not validation["ok"]:
-        print("SEATUNNEL ARTIFACT VALIDATION FAILURES")
-        for failure in validation["failures"]:
-            print(f"  - {failure['problem']}")
-        print()
-
-    if not duckdb_validation["ok"]:
-        print("DUCKDB ARTIFACT VALIDATION FAILURES")
-        for failure in duckdb_validation["failures"]:
-            print(f"  - {failure['problem']}")
-        print()
-
-    print("Written:")
+def _size(written: List[Path], name: str) -> str:
+    """The size of one written file, or a dash when it is not there."""
     for path in written:
-        try:
-            shown = path.relative_to(output_dir.parent)
-        except ValueError:
-            shown = path
-        print(f"  {shown}")
-
-
-def _print_findings(title: str, findings: List[Diag], limit: int = 20) -> None:
-    """Print one severity group. Never truncates without saying how much was cut."""
-    if not findings:
-        return
-    print(title)
-    for item in findings[:limit]:
-        where = f" [{item.rule_id or item.table}]" if (item.rule_id or item.table) else ""
-        print(f"  - {item.code}{where}: {item.message}")
-    if len(findings) > limit:
-        print(f"  ... and {len(findings) - limit} more")
-    print()
+        if path.name == name:
+            return f"{path.stat().st_size:>7,} bytes"
+    return "  absent"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -8692,7 +8880,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         default=str(DEFAULT_SPEC),
         help=(
             "the approved migration specification. Defaults to the project's own "
-            "input/migration-spec-scenario-2-explicit-scn.yaml, so the command behaves the same wherever it "
+            "input/hr-spec.yaml, so the command behaves the same wherever it "
             "is run from"
         ),
     )
@@ -8710,7 +8898,6 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             "when that file exists."
         ),
     )
-    parser.add_argument("--strict", action="store_true", help="exit non-zero when anything blocks the run")
     parser.add_argument("--self-test", action="store_true", help="run the built-in smoke test and exit")
     args = parser.parse_args(argv)
 
@@ -8718,13 +8905,17 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         return self_test()
 
     spec_path = Path(args.spec).expanduser()
-    output_dir = Path(args.output_dir).expanduser()
 
     if not spec_path.is_file():
         print(f"\n  Specification not found: {spec_path}", file=sys.stderr)
         print(f"  The default is {DEFAULT_SPEC}", file=sys.stderr)
         print("  Pass --spec to compile a different one.\n", file=sys.stderr)
         return 2
+
+    # One specification, one folder, named after the file. Compiling a second
+    # specification therefore cannot overwrite the first one's output, which is
+    # what makes "give me a new spec" safe to repeat.
+    output_dir = Path(args.output_dir).expanduser() / output_folder_name(spec_path)
 
     spec = load_yaml(spec_path)
     catalog, catalog_path = _load_optional_catalog(spec, args.catalog, spec_path)
@@ -8735,15 +8926,12 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     written = write_artifacts(output_dir, result["artifacts"])
     summarize(result, output_dir, written)
 
-    blocking = result["diagnostics"].blocking + [
-        d for job in result["jobs"] for d in job.diagnostics.blocking
-    ]
-    # Both artifacts are validated, and both are held to the same rule: the file
-    # that leaves this compiler is the file that was checked. A failure in either
-    # is a failed compile, not a warning about a generated document.
+    # The only thing that changes the exit code is whether a *generated file*
+    # survived being read back and re-parsed. Whether the specification compiled
+    # cleanly is DuckDB's question, not this program's: a rule the compiler could
+    # not express is already carried into duckdb.yaml as an assumption or a
+    # governance check, where the owner will meet it.
     if not result["validation"]["ok"] or not result["duckdb_validation"]["ok"]:
-        return 1
-    if args.strict and blocking:
         return 1
     return 0
 
@@ -8949,7 +9137,370 @@ def self_test() -> int:
                 failures += 1
                 print(f"        expected {expected!r} in: {message[:300] or '<no error raised>'}")
 
-    print(f"\nself-test: {len(cases) + 12 - failures}/{len(cases) + 12} passed")
+    # The whole planning path, from a one-table specification to two files. This
+    # is the only in-module check that exercises `plan_jobs` end to end, which is
+    # exactly where a scope that resolves to nothing turns into `jobs: 0`.
+    with tempfile.TemporaryDirectory() as tmp:
+        catalog_path = Path(tmp) / "catalog.yaml"
+        catalog_path.write_text(
+            'tables:\n'
+            '  - schema: HR\n'
+            '    name: ORDERS\n'
+            '    primaryKey: [ORDER_ID]\n'
+            '    columns:\n'
+            '      - { name: ORDER_ID,    type: "NUMBER(10)", nullable: false }\n'
+            '      - { name: CUSTOMER_ID, type: "NUMBER(10)", nullable: false }\n'
+            '      - { name: ORDER_DATE,  type: "DATE",       nullable: false }\n'
+            '      - { name: AMOUNT,      type: "NUMBER(12,2)" }\n'
+            '      - { name: STATUS,      type: "VARCHAR2(20)" }\n',
+            encoding="utf-8",
+        )
+        spec_path = Path(tmp) / "hr-spec.yaml"
+        spec_path.write_text(
+            'schemaVersion: "5.1.0"\n'
+            f"catalog: {catalog_path.name}\n"
+            "engines:\n"
+            "  source: { engine: oracle }\n"
+            "  target: { engine: postgresql }\n"
+            "scope:\n"
+            "  include:\n"
+            "    - { objectClass: table, schema: HR, name: ORDERS }\n"
+            "rules:\n"
+            "  - id: orders-table\n"
+            "    match: { objectClass: table, schema: HR, name: ORDERS }\n"
+            "    target: { schema: public, table: orders }\n"
+            "acceptance:\n"
+            "  checks: [row-count-exact]\n"
+            "run:\n"
+            "  acquisition: snapshot\n"
+            "  capture: { startPosition: explicit-scn, scn: 123456789 }\n",
+            encoding="utf-8",
+        )
+
+        spec = load_yaml(spec_path)
+        found, found_path = _load_optional_catalog(spec, None, spec_path)
+        ok = found_path is not None
+        print(f"  {'PASS' if ok else 'FAIL'}  a catalog named by the specification is found")
+        if not ok:
+            failures += 1
+
+        catalog = parse_catalog(spec, found, str(found_path or ""))
+        catalog = filter_catalog_to_spec(catalog, spec, Diagnostics())
+        ok = [t.name for t in catalog.tables] == ["ORDERS"]
+        print(f"  {'PASS' if ok else 'FAIL'}  the catalog survives filtering for a concrete schema")
+        if not ok:
+            failures += 1
+
+        diags = Diagnostics()
+        naming = Naming(spec, diags)
+        TypeResolver(spec, catalog, diags)
+        plans = plan_jobs(spec, catalog, naming, diags)
+        ok = len(plans) == 1 and plans[0].target_schema == "public" and plans[0].target_table == "orders"
+        print(f"  {'PASS' if ok else 'FAIL'}  one plan for HR.ORDERS -> public.orders")
+        if not ok:
+            failures += 1
+            print(f"        {len(plans)} plan(s): {[(p.job_id, p.target_schema, p.target_table) for p in plans]}")
+
+        built = compile_all(spec, spec_path, found, found_path)
+        jobs = built["jobs"]
+        ok = len(jobs) == 1 and jobs[0].query is not None
+        print(f"  {'PASS' if ok else 'FAIL'}  the job compiles to a query")
+        if not ok:
+            failures += 1
+            for item in built["diagnostics"].blocking:
+                print(f"        {item.code}: {item.message[:140]}")
+
+        if jobs and jobs[0].query is not None:
+            query = jobs[0].query
+            ok = f"AS OF SCN {SCN_BIND}" in query
+            print(f"  {'PASS' if ok else 'FAIL'}  the source query is pinned to the SCN bind")
+            if not ok:
+                failures += 1
+                print(f"        {query[:160]}")
+
+            ok = "123456789" not in query
+            print(f"  {'PASS' if ok else 'FAIL'}  the configured SCN is not hardcoded into the SQL")
+            if not ok:
+                failures += 1
+
+            ok = jobs[0].target["schema"] == "public" and jobs[0].target["table"] == "orders"
+            print(f"  {'PASS' if ok else 'FAIL'}  the target is public.orders")
+            if not ok:
+                failures += 1
+
+        conf = built["artifacts"].get(SEATUNNEL_CONF_NAME, "")
+        ok = conf.count("_ddl {") == 1 and conf.count("_data {") == 1
+        print(f"  {'PASS' if ok else 'FAIL'}  one DDL job and one data job")
+        if not ok:
+            failures += 1
+
+        ok = "CREATE TABLE IF NOT EXISTS" in conf
+        print(f"  {'PASS' if ok else 'FAIL'}  the DDL job carries a CREATE TABLE")
+        if not ok:
+            failures += 1
+
+        ok = "INSERT INTO" in conf
+        print(f"  {'PASS' if ok else 'FAIL'}  the data job carries an INSERT")
+        if not ok:
+            failures += 1
+
+        ok = built["duckdb_plans"] and built["duckdb_plans"][0].check_count > 0
+        print(f"  {'PASS' if ok else 'FAIL'}  one DuckDB job with validation rules")
+        if not ok:
+            failures += 1
+
+        ok = built["validation"]["ok"] and built["duckdb_validation"]["ok"]
+        print(f"  {'PASS' if ok else 'FAIL'}  both artifacts survive re-validation")
+        if not ok:
+            failures += 1
+            print(f"        {built['validation'].get('failures')}")
+            print(f"        {built['duckdb_validation'].get('failures')}")
+
+        ok = built["duckdb_plans"][0].projection is not None
+        print(f"  {'PASS' if ok else 'FAIL'}  the DuckDB projection translates")
+        if not ok:
+            failures += 1
+
+        # A wildcard schema must enumerate the catalog, not discard it.
+        wildcard = dict(spec)
+        wildcard["scope"] = {"include": [{"objectClass": "table", "schema": "*", "name": "ORDERS"}]}
+        wildcard["rules"] = [
+            {"id": "orders-table",
+             "match": {"objectClass": "table", "schema": "*", "name": "ORDERS"},
+             "target": {"schema": "public", "table": "orders"}}
+        ]
+        kept = filter_catalog_to_spec(
+            parse_catalog(wildcard, found, ""), wildcard, Diagnostics()
+        )
+        ok = not kept.empty
+        print(f"  {'PASS' if ok else 'FAIL'}  a wildcard schema keeps the catalog")
+        if not ok:
+            failures += 1
+
+        # A relation the scope resolves and the rules name, but that is then excluded,
+        # produces no job. `jobs: 0` is truthful, yet two empty files do not say
+        # whether anything matched -- so the net statement is required.
+        excluded = dict(spec)
+        excluded["scope"] = {
+            "include": [{"objectClass": "table", "schema": "HR", "name": "ORDERS"}],
+            "exclude": [{"objectClass": "table", "schema": "*", "name": "*"}],
+        }
+        excluded_diags = Diagnostics()
+        excluded_naming = Naming(excluded, excluded_diags)
+        excluded_plans = plan_jobs(
+            excluded, parse_catalog(excluded, found, ""), excluded_naming, excluded_diags
+        )
+        codes = {d.code for d in excluded_diags.items}
+        ok = not excluded_plans and "PLANNER_EMPTY_RESULT" in codes
+        print(f"  {'PASS' if ok else 'FAIL'}  relations dropped by scope.exclude are stated, not silent")
+        if not ok:
+            failures += 1
+            print(f"        {len(excluded_plans)} plan(s), codes {sorted(codes)}")
+
+        # A scope matching genuinely nothing is not a defect, and must stay quiet:
+        # a specification that migrates no table is a legitimate, empty migration.
+        # A rule that names exactly what it migrates is authoritative, so a table the
+        # catalog has no metadata for is still migrated -- with its columns
+        # becoming assumptions recorded in the file, rather than the table
+        # vanishing. The specification is the source of truth.
+        uncatalogued = dict(spec)
+        uncatalogued["scope"] = {"include": [{"objectClass": "table", "schema": "HR", "name": "GHOST"}]}
+        uncatalogued["rules"] = [
+            {"id": "ghost",
+             "match": {"objectClass": "table", "schema": "HR", "name": "GHOST"},
+             "target": {"schema": "public", "table": "ghost"}}
+        ]
+        ghost_diags = Diagnostics()
+        ghost_naming = Naming(uncatalogued, ghost_diags)
+        ghost_plans = plan_jobs(
+            uncatalogued, parse_catalog(uncatalogued, found, ""), ghost_naming, ghost_diags
+        )
+        ok = len(ghost_plans) == 1
+        print(f"  {'PASS' if ok else 'FAIL'}  a rule naming a table the catalog lacks still migrates it")
+        if not ok:
+            failures += 1
+            print(f"        {len(ghost_plans)} plan(s), codes {sorted({d.code for d in ghost_diags.items})}")
+
+    # Does the compiler need a catalog file? It needs the source's *shape* -- which
+    # columns the relation has, and their types. A specification may state that
+    # itself, under a table rule's own `columns:`, which is what makes it possible
+    # to compile with nothing but the one file. These checks pin both halves of that:
+    # the specification alone is enough, and it is not enough when it says nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+
+        inline_spec = tmp_path / "inline-spec.yaml"
+        inline_spec.write_text(
+            'schemaVersion: "5.1.0"\n'
+            "engines:\n"
+            "  source: { engine: oracle }\n"
+            "  target: { engine: postgresql }\n"
+            "scope:\n"
+            "  include:\n"
+            "    - { objectClass: table, schema: HR, name: ORDERS }\n"
+            "rules:\n"
+            "  - id: orders-table\n"
+            "    match: { objectClass: table, schema: HR, name: ORDERS }\n"
+            "    target: { schema: public, table: orders }\n"
+            "    columns:\n"
+            '      - { name: ORDER_ID,    type: "NUMBER(10)",      nullable: false }\n'
+            '      - { name: CUSTOMER_ID, type: "NUMBER(10)" }\n'
+            '      - { name: ORDER_DATE,  type: "DATE" }\n'
+            '      - { name: AMOUNT,      type: "NUMBER(12,2)" }\n'
+            '      - { name: STATUS,      type: "VARCHAR2(20)" }\n'
+            "    primaryKey: [ORDER_ID]\n"
+            "acceptance:\n"
+            "  checks: [row-count-exact]\n"
+            "run:\n"
+            "  acquisition: snapshot\n"
+            "  capture: { startPosition: explicit-scn, scn: 123456789 }\n",
+            encoding="utf-8",
+        )
+
+        solo = compile_all(load_yaml(inline_spec), inline_spec, None, None)
+        solo_jobs = solo["jobs"]
+        ok = len(solo_jobs) == 1 and solo_jobs[0].query is not None
+        print(f"  {'PASS' if ok else 'FAIL'}  a specification alone, with its own columns, compiles")
+        if not ok:
+            failures += 1
+            for item in solo["diagnostics"].blocking[:3]:
+                print(f"        {item.code}: {item.message[:140]}")
+
+        # The target names follow the specification's own naming rules, so what
+        # matters here is that all five declared columns and their Oracle types are
+        # the ones the DDL was built from.
+        inline_conf = solo["artifacts"].get(SEATUNNEL_CONF_NAME, "")
+        ok = all(
+            f'"{name}"' in inline_conf
+            for name in ("ORDER_ID", "CUSTOMER_ID", "ORDER_DATE", "AMOUNT", "STATUS")
+        ) and "NUMERIC(12, 2)" in inline_conf and "VARCHAR(20)" in inline_conf
+        print(f"  {'PASS' if ok else 'FAIL'}  the declared columns and types reach the DDL")
+        if not ok:
+            failures += 1
+            print(f"        missing from {len(inline_conf)} bytes of config")
+
+        # A key stated inline has to reach the DDL too: a change-aware write and the
+        # key check in duckdb.yaml both need one, and neither can invent it.
+        ok = 'PRIMARY KEY ("ORDER_ID")' in inline_conf
+        print(f"  {'PASS' if ok else 'FAIL'}  a key declared inline reaches the CREATE TABLE")
+        if not ok:
+            failures += 1
+
+        ok = not any(d.code == "NO_PRIMARY_KEY" for d in solo["diagnostics"].items)
+        print(f"  {'PASS' if ok else 'FAIL'}  an inline key is not reported as missing")
+        if not ok:
+            failures += 1
+
+        ok = any(
+            d.code == "SOURCE_SHAPE_FROM_SPEC"
+            for j in solo["jobs"]
+            for d in j.diagnostics.items
+        )
+        print(f"  {'PASS' if ok else 'FAIL'}  a shape taken from the spec is recorded, not silent")
+        if not ok:
+            failures += 1
+
+        # And into the files. The person who needs to know a projection came from a
+        # hand-written list only has the artifact; a diagnostic that never reaches
+        # it is a diagnostic nobody reads.
+        solo_duckdb = solo["artifacts"].get(DUCKDB_JOBS_NAME, "")
+        solo_conf = solo["artifacts"].get(SEATUNNEL_CONF_NAME, "")
+        ok = (
+            any("own `columns:`" in a for a in solo_jobs[0].assumptions)
+            and "own `columns:`" in solo_duckdb
+            and "own `columns:`" in solo_conf
+        ) if solo_jobs else False
+        print(f"  {'PASS' if ok else 'FAIL'}  a spec-supplied shape reaches both artifacts")
+        if not ok:
+            failures += 1
+            print(f"        assumptions {solo_jobs[0].assumptions if solo_jobs else []}")
+
+        # An Oracle-extracted catalog outranks a hand-written list. A stale
+        # `columns:` must not be able to silently govern a migration.
+        (tmp_path / "catalog.yaml").write_text(
+            'tables:\n'
+            '  - schema: HR\n'
+            '    name: ORDERS\n'
+            '    primaryKey: [ORDER_ID]\n'
+            '    columns:\n'
+            '      - { name: ORDER_ID, type: "NUMBER(10)" }\n'
+            '      - { name: SECRET,   type: "VARCHAR2(64)" }\n',
+            encoding="utf-8",
+        )
+        rival_path = tmp_path / "rival-spec.yaml"
+        rival_path.write_text(
+            'schemaVersion: "5.1.0"\n'
+            "catalog: catalog.yaml\n"
+            "engines:\n"
+            "  source: { engine: oracle }\n"
+            "  target: { engine: postgresql }\n"
+            "scope:\n"
+            "  include:\n"
+            "    - { objectClass: table, schema: HR, name: ORDERS }\n"
+            "rules:\n"
+            "  - id: orders-table\n"
+            "    match: { objectClass: table, schema: HR, name: ORDERS }\n"
+            "    target: { schema: public, table: orders }\n"
+            "    columns:\n"
+            '      - { name: ORDER_ID, type: "NUMBER(10)" }\n',
+            encoding="utf-8",
+        )
+        rival_spec = load_yaml(rival_path)
+        found, found_path = _load_optional_catalog(rival_spec, None, rival_path)
+        rival_conf = compile_all(rival_spec, rival_path, found, found_path)["artifacts"].get(
+            SEATUNNEL_CONF_NAME, ""
+        )
+        ok = "SECRET" in rival_conf
+        print(f"  {'PASS' if ok else 'FAIL'}  a catalog outranks an inline column list")
+        if not ok:
+            failures += 1
+            print("        the inline list governed the migration instead of the catalog")
+
+        # And when neither states the shape, there is no honest job to emit. The
+        # table does not quietly become an empty projection.
+        bare_path = tmp_path / "bare-spec.yaml"
+        bare_path.write_text(
+            'schemaVersion: "5.1.0"\n'
+            "engines:\n"
+            "  source: { engine: oracle }\n"
+            "  target: { engine: postgresql }\n"
+            "scope:\n"
+            "  include:\n"
+            "    - { objectClass: table, schema: HR, name: ORDERS }\n"
+            "rules:\n"
+            "  - id: orders-table\n"
+            "    match: { objectClass: table, schema: HR, name: ORDERS }\n"
+            "    target: { schema: public, table: orders }\n"
+            "acceptance:\n"
+            "  checks: [row-count-exact]\n"
+            "run:\n"
+            "  acquisition: snapshot\n",
+            encoding="utf-8",
+        )
+        bare = compile_all(load_yaml(bare_path), bare_path, None, None)
+        # Per-job findings live on the job, not on the spec-wide sink: one job's
+        # missing shape is not a statement about the whole specification.
+        codes = {d.code for j in bare["jobs"] for d in j.diagnostics.items}
+        ok = (
+            "SOURCE_SHAPE_UNKNOWN" in codes
+            and all(j.query is None for j in bare["jobs"])
+            and all(j.status == "BLOCKED" for j in bare["jobs"])
+        )
+        print(f"  {'PASS' if ok else 'FAIL'}  a spec stating no columns is blocked, not narrowed")
+        if not ok:
+            failures += 1
+            print(f"        codes {sorted(codes)}, statuses {[j.status for j in bare['jobs']]}")
+
+        # A blocking finding has to reach the files, or nobody reading the output
+        # ever hears it.
+        bare_duckdb = bare["artifacts"].get(DUCKDB_JOBS_NAME, "")
+        bare_conf = bare["artifacts"].get(SEATUNNEL_CONF_NAME, "")
+        ok = "SOURCE_SHAPE_UNKNOWN" in bare_duckdb or "SOURCE_SHAPE_UNKNOWN" in bare_conf
+        print(f"  {'PASS' if ok else 'FAIL'}  the block is stated in the artifact, not only in memory")
+        if not ok:
+            failures += 1
+
+    print(f"\nself-test: {len(cases) + 30 - failures}/{len(cases) + 30} passed")
     return 1 if failures else 0
 
 

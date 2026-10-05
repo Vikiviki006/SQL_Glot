@@ -1,0 +1,87 @@
+# The simplest complete migration: one Oracle table, one PostgreSQL table, a
+# snapshot taken at a fixed SCN.
+#
+# This file compiles on its own -- no catalog, no flags:
+#
+#   python src/transpiler.py --spec input/hr-spec.yaml
+#
+# The table rule states its own `columns:` below, which is what makes that
+# possible. See need_catalog.md for when a separate catalog file is the better
+# choice, and what the compiler cannot do without either.
+#
+# Generated output lands in output/hr-spec/ as exactly two files:
+#   seatunnel.conf   the DDL job and the data job
+#   duckdb.yaml      the validation rules for the load
+
+specVersion: 1
+schemaVersion: "5.1.0"
+dictionaryVersion: 1
+
+engines:
+  source:
+    engine: oracle
+    version: "19"
+  target:
+    engine: postgresql
+    version: "17"
+
+# No `catalog:` line, and no catalog file is needed. The rule's `columns:` below
+# is the specification stating what HR.ORDERS contains, so this file is
+# self-sufficient. A catalog extracted from Oracle would be authoritative and
+# would take precedence; the inline list is here so one is not required.
+
+scope:
+  include:
+    - objectClass: table
+      schema: HR
+      name: ORDERS
+
+rules:
+  - id: orders-table
+    match:
+      objectClass: table
+      schema: HR
+      name: ORDERS
+    target:
+      schema: public
+      table: orders
+
+    # The source relation's own columns, declared here so this file compiles on
+    # its own with no catalog. Oracle types, as they are in the source.
+    columns:
+      - { name: ORDER_ID,    type: "NUMBER(10)",      nullable: false }
+      - { name: CUSTOMER_ID, type: "NUMBER(10)",      nullable: false }
+      - { name: ORDER_DATE,  type: "DATE",            nullable: false }
+      - { name: AMOUNT,      type: "NUMBER(12,2)" }
+      - { name: STATUS,      type: "VARCHAR2(20)" }
+
+    # The source relation's key. It reaches the CREATE TABLE, and without it the
+    # target is created unkeyed -- which an upsert write cannot use.
+    primaryKey: [ORDER_ID]
+
+naming:
+  schema:
+    policy: mirror                 # HR stays HR; nothing is mapped or flattened
+  case: lower
+  onReservedOrSpecial: quote
+
+acceptance:
+  checks:
+    - row-count-exact
+
+run:
+  shape: migration
+  acquisition: snapshot
+
+  # The read is pinned to a position in the Oracle redo log, so the migration sees
+  # one consistent snapshot rather than whatever the table held at whatever moment
+  # each query ran.
+  #
+  # `scn:` here is the configuration. It is deliberately NOT written into the
+  # generated SQL: every query says `AS OF SCN ${run_scn}`, and the runner
+  # substitutes it at submit time. A number baked into SQL is a number that can no
+  # longer be changed without regenerating the job.
+  capture:
+    reader: logminer
+    startPosition: explicit-scn
+    scn: 123456789

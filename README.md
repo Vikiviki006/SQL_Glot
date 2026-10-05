@@ -1,15 +1,29 @@
 # Migration spec → Apache SeaTunnel / DuckDB
 
-Compiles one approved migration specification (schema 5.1.0) into **two files**,
-one per runner, and nothing else.
+Compile one approved migration specification (schema 5.1.0) into **two files**,
+one per runner.
 
 | File | What it is |
 | --- | --- |
-| `output/seatunnel.conf` | **one** SeaTunnel HOCON file. For every target relation, a `<schema>_<table>_ddl` job and a `<schema>_<table>_data` job. Each carries the **source query**, the **target query**, the **DDL** or **DML commands**, and **`schema_save_mode`**. |
-| `output/duckdb.yaml` | **one** DuckDB YAML file. The **validation rules** the specification implies, the **compiled query** for each of them, and the **source queries** they compare against. |
+| `<spec>/seatunnel.conf` | **one** SeaTunnel HOCON file. For every target relation, a `<schema>_<table>_ddl` job and a `<schema>_<table>_data` job. Each carries the **source query**, the **target query**, the **DDL** or **DML commands**, and **`schema_save_mode`**. |
+| `<spec>/duckdb.yaml` | **one** DuckDB YAML file. The **validation rules** the specification implies, the **compiled query** for each of them, and the **source queries** they compare against. |
 
-There is no orchestrator, no index, no report file. The two files go to two
-runners; nothing else decides when anything runs, and diagnostics go to stdout.
+`<spec>` is the specification file's own name, under `output/`:
+
+```text
+output/migration-spec/seatunnel.conf
+output/migration-spec/duckdb.yaml
+output/migration-spec-scenario-2-explicit-scn/seatunnel.conf
+output/migration-spec-scenario-2-explicit-scn/duckdb.yaml
+```
+
+**Give it any specification and it gets its own folder.** Two specifications can
+never overwrite each other's output, and recompiling one leaves the others alone.
+
+The console is a receipt — which files, how big, how many jobs. It does not report
+findings. Whether a rule compiled correctly, what was assumed and what a human must
+sign off on are answered by running the checks in `duckdb.yaml`, which is where
+they live.
 
 All of it is produced by **one module**, `src/transpiler.py`, which holds every
 rule. `AGENT.md` is the operating document: the flow, the invariants, and the
@@ -31,15 +45,110 @@ relative path you pass is still relative to your cwd, as usual.
 Note the package name: `PyYAML`, not `yaml`. There is no PyPI distribution called
 `yaml`, so `pip install yaml` fails.
 
-Any specification works — pass it and go:
+Any specification works — pass it and it compiles into its own folder:
 
 ```powershell
-python src\transpiler.py --spec input\migration-spec-scenario-2-explicit-scn.yaml
-python src\transpiler.py --spec input\other.yaml --catalog input\other-catalog.yaml
-
-python src\transpiler.py --strict      # any blocking finding exits non-zero
-python src\transpiler.py --self-test   # dialects and HOCON/YAML, no inputs
+python src\transpiler.py                                             # the default spec
+python src\transpiler.py --spec input\my-new-migration.yaml          # a new one
+python src\transpiler.py --spec input\hr.yaml --catalog input\hr-catalog.yaml
+python src\transpiler.py --output-dir D:\build                       # a different root
+python src\transpiler.py --self-test                                 # no inputs needed
 ```
+
+A specification can name its own catalog, so no flag is needed per spec:
+
+```yaml
+catalog: catalog_hr.yaml     # resolved beside the specification
+```
+
+Also searched automatically, beside the spec: `catalog.yaml`, `catalog.yml`,
+`<spec-stem>_catalog.yaml`, `catalog_<spec-stem>.yaml`. `--catalog` still wins,
+and an explicit one that does not exist is an error rather than a silent fallback.
+
+### A catalog file is optional
+
+`--catalog` is not required. A table rule can state what its own relation contains,
+and then the specification compiles on its own — which is exactly what
+`input/hr-spec.yaml` does:
+
+```yaml
+rules:
+  - id: orders-table
+    match:   { objectClass: table, schema: HR, name: ORDERS }
+    target:  { schema: public, table: orders }
+    columns:
+      - { name: ORDER_ID,    type: "NUMBER(10)",      nullable: false }
+      - { name: CUSTOMER_ID, type: "NUMBER(10)",      nullable: false }
+      - { name: ORDER_DATE,  type: "DATE",            nullable: false }
+      - { name: AMOUNT,      type: "NUMBER(12,2)" }
+      - { name: STATUS,      type: "VARCHAR2(20)" }
+    primaryKey: [ORDER_ID]
+```
+
+```powershell
+python src\transpiler.py --spec input\hr-spec.yaml
+```
+
+```
+  catalog     : none supplied (1 table(s))
+```
+
+The compiler needs the source's **shape** — its columns, Oracle types and key —
+because a projection is a list of columns and a rule only names the ones it
+transforms. It looks in three places, and stops at the first that answers:
+
+| Source | What it is |
+| --- | --- |
+| a catalog | extracted from Oracle. Authoritative. |
+| the rule's own `columns:` | the specification stating the shape outright. |
+| the columns the rules name | a floor: only what the rules mention migrates. |
+
+Two things follow from that ordering. A **catalog wins** over an inline list, so a
+stale hand-written list cannot silently govern a migration. And if nothing
+describes a relation at all, the job is **blocked** (`SOURCE_SHAPE_UNKNOWN`) rather
+than emitted with an empty projection — a job that loads nothing must not look like
+a migration.
+
+**Wildcards still require a catalog.** `schema: "*"` names every schema and only
+the database knows which exist, so a wildcard scope cannot be resolved from a
+specification. That is the one case with no inline alternative.
+
+[`need_catalog.md`](need_catalog.md) has the full argument, including when an
+Oracle-extracted catalog is still the better answer despite all this — and the
+short answer is: for anything meant to actually run.
+
+### Scope and wildcards
+
+`scope.include` with a **wildcard schema** (`schema: "*"`) cannot be resolved from
+the specification alone — `*` names every schema, and only the catalog says which
+exist. It requires a catalog; without one the run says so rather than compiling a
+subset. This is the whole reason `input/catalog_orders_wildcard.yaml` exists.
+
+`scope.exclude` is applied after resolution, and each excluded relation is named.
+
+Two relations that resolve to the same `target.table` are a **collision**, not a
+merge, and are reported as one — the alternative is two jobs overwriting one
+relation. Combining several sources into one target is a `cardinality/merge` step
+naming its sources.
+
+A rule that names a table the catalog does not list is still migrated, with its
+columns recorded as assumptions in the file. The specification is the source of
+truth; a missing catalog entry is not a reason to drop what was asked for.
+
+```
+migration-transpiler 3.0.0
+
+  spec        : input\migration-spec.yaml
+  output      : ...\output\migration-spec
+
+  seatunnel.conf  22 jobs    52 columns    68,858 bytes
+  duckdb.yaml     11 jobs   106 checks   100,308 bytes
+
+  11 of 12 target relations compiled
+```
+
+Exit codes: `0` compiled, `1` a generated file did not survive being read back and
+re-parsed, `2` the specification could not be read.
 
 `--catalog` is looked for beside the specification first (`input/catalog.yaml`
 next to whatever `--spec` you passed), then in the project root. If you pass
@@ -75,16 +184,13 @@ is the first such line rather than the cause.
 
 `--catalog` is required whenever the specification names objects by wildcard
 (`SHOP.*`, `ORDERS_20*`, `column: AMOUNT`). Without it those rules cannot be
-enumerated and the compiler says so rather than compiling a subset. It is looked
-for beside the specification first, then in the project root.
-
-The compiler exits non-zero if either file fails re-validation, whether or not
-`--strict` is passed. It exits 2, with an explanation and no output, when the
-specification cannot be read.
+enumerated, so the relations they name are simply omitted rather than compiled as
+a partial guess. It is looked for beside the specification first, then in the
+project root.
 
 ---
 
-## `output/seatunnel.conf`
+## `output/<spec>/seatunnel.conf`
 
 ```hocon
 job {
@@ -139,7 +245,7 @@ A `*_ddl` job must pass before its `*_data` job.
 
 ---
 
-## `output/duckdb.yaml`
+## `output/<spec>/duckdb.yaml`
 
 ```yaml
 job:
@@ -264,37 +370,52 @@ subclassed dialects; SQLGlot documents limitations with runtime subclassing ther
 
 ## Reading the output
 
-There is no report file, so the **console is the report**. After writing the two
-files it prints:
+The console is a receipt, not a report:
 
 ```text
-ARTIFACTS      what was produced, and whether each file survived re-validation
-COVERAGE       jobs ready/blocked, columns, and a count per severity
-BLOCKING       the run must not proceed
-GOVERNANCE     a human must sign off
-ASSUMPTION     a deterministic choice someone should confirm
-EDGE           handled and reported for audit
-NAMING         which identifiers were quoted or hash-shortened
-JOBS           per job: sources, operations, columns, key, DDL, mode, assumptions
+spec        which specification was compiled
+output      the folder it went to
+seatunnel.conf / duckdb.yaml   jobs, columns or checks, and size
+N of M target relations compiled
 ```
 
-`BLOCK` means the run must not proceed. `GOVERNANCE` means a human must sign off.
-`ASSUMPTION` means a deterministic choice was made that someone should confirm.
-`EDGE` means an edge case was handled and is reported for audit.
+That is all it prints on a normal run. **It does not report findings** — no
+blocking list, no governance sign-offs, no assumptions, no edge cases — because
+none of those are the compiler's to answer. They are answered by running the
+checks in `duckdb.yaml`, where each one states what must be true and how to find
+out:
+
+- a rule the compiler could not express is not silently dropped; it becomes a
+  `V-GOVERNANCE-*` check or an `assumptions` entry **inside the job body**
+- a value state the specification said must survive is a `V-FIDELITY-*` check
+- a relation the compiler could not resolve produces no job, and is named in the
+  file header **with the code and message that stopped it** — naming the absence
+  without its cause tells the reader nothing about what to change
+
+The one thing the console will not stay quiet about is a *generated file* that did
+not survive being read back and re-parsed. That is a statement about the compiler's
+own output, not about the specification, and it exits non-zero.
 
 ## Layout
 
 ```text
 AGENT.md                     the flow, the invariants, the edge-case table
+need_catalog.md              why a catalog file is (and is not) needed
 src/transpiler.py            every rule; one module
 requirements.txt             PyYAML and sqlglot
-input/migration-spec.yaml    the approved specification
-output/seatunnel.conf        generated
-output/duckdb.yaml           generated
+input/hr-spec.yaml           HR.ORDERS -> public.orders. Self-sufficient: its
+                             rule declares columns, so it needs no catalog.
+input/hr-spec-wildcard.yaml  schema: "*", so it does need one
+input/catalog_orders_wildcard.yaml   HR/SALES/ARCHIVE, each holding ORDERS
+input/migration-spec.yaml    the reference specification
+output/<spec-name>/          generated: seatunnel.conf, duckdb.yaml
 ```
 
 `--self-test` is the only regression suite and lives inside `src/transpiler.py`,
-so it needs no test files and no input.
+so it needs no test files and no input. It covers the dialects, the Oracle→DuckDB
+rewrites, specification-reading failures, the three places a source shape can come
+from, and the full `HR.ORDERS → public.orders` path from `plan_jobs` to both
+re-validated files.
 
 ## Known defects
 

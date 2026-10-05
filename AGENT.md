@@ -9,32 +9,43 @@ the edge cases that are easy to get wrong. Read it before changing
 
 ## 1. What this is
 
-One approved migration specification in; **two files** out, one per runner.
+One approved migration specification in; **two files** out, one per runner, in a
+folder named after the specification.
 
 ```text
-input/migration-spec.yaml          the approved specification -- source of truth
-input/catalog.yaml                 the Oracle source metadata it refers to
+input/<any>.yaml                    the approved specification -- source of truth
+input/catalog.yaml                  optional: Oracle source metadata, when the
+                                    specification does not state its own columns
         |
         v
-src/transpiler.py                  one module, every rule
+src/transpiler.py                   one module, every rule
         |
-        +--> output/seatunnel.conf   ONE HOCON file
+        +--> output/<spec>/seatunnel.conf   ONE HOCON file
         |        for every target relation a <schema>_<table>_ddl job and a
         |        <schema>_<table>_data job, each carrying the source query, the
         |        target query, the DDL or DML commands, and schema_save_mode
         |
-        +--> output/duckdb.yaml      ONE YAML file
+        +--> output/<spec>/duckdb.yaml      ONE YAML file
                  the validation rules the specification implies, the compiled
                  query for each of them in DuckDB, and the source queries they
                  compare against
 ```
 
-There are no other outputs. No orchestrator, no scheduler, no index, no report.
-The two files are handed to two runners; nothing else decides when anything runs,
-and nothing else records what the compiler found — **the findings go to stdout**.
+A catalog file is **optional**. A table rule that states its own `columns:` is
+self-sufficient, and that is the recommended shape for a small hand-reviewed
+migration. `need_catalog.md` explains what the compiler needs the shape for, the
+three places it will look for it, and when a catalog extracted from Oracle is
+still the right answer.
+
+There are no other outputs. No orchestrator, no scheduler, no index, no report,
+and **no findings on the console** — see §3a for where a finding goes instead.
+
+Every specification gets its own folder, so compiling a new one cannot overwrite
+another's, and recompiling one leaves the rest untouched.
 
 The specification is never edited. If it says something this compiler cannot
-express, the job is **blocked and reported**, never approximated.
+express, the job is omitted and the omission named in the file header — never
+approximated.
 
 ---
 
@@ -93,18 +104,30 @@ validated version and the shipped version. That is a `BLOCK`.
 The order is not a preference. Each stage exists because the next one trusts it.
 
 ```text
- 1. validate_spec            the specification is sound            abort
- 2. validate_query           every query round-trips byte-stably   abort
- 3. validate_source_query    in the SOURCE engine's own dialect    abort
- 4. validate_target_query    in the TARGET engine's own dialect    abort
- 5. validate_seatunnel_query the .conf itself, re-read             abort
- 6. validate_duckdb_query    the .yaml itself, re-read             abort
- 7. emit                     seatunnel.conf + duckdb.yaml, then print
+ 1. parse_catalog            Oracle metadata, if any                 --
+ 2. filter_catalog_to_spec   drop a catalog about other schemas      --
+ 3. merge_inline_source_tables  fold in each rule's own `columns:`   --
+ 4. validate_spec            the specification is sound             omit what fails
+ 5. plan_jobs                scope x rules -> one plan per target   --
+ 6. compile_job              one plan -> query, columns, DDL       blocked jobs skip
+ 7. validate_query           every query round-trips byte-stably    omit what drifts
+ 8. validate_source_query    in the SOURCE engine's own dialect     omit what fails
+ 9. validate_target_query    in the TARGET engine's own dialect     omit what fails
+10. validate_seatunnel_query the .conf itself, re-read              exit non-zero
+11. validate_duckdb_query    the .yaml itself, re-read              exit non-zero
+12. emit                     output/<spec>/{seatunnel.conf, duckdb.yaml}
 ```
 
-Stages 1–4 are compile-time and are reported by `summarize()`. Stages 5–6 are
-artifact validation and are what `main()` exits non-zero on. There is no stage 7
-onward: the two runners take it from there.
+Stage 3 sits where it does because everything after it reads the catalog and
+should not care where a shape came from. See §7 "Where the source shape comes
+from".
+
+Stages 4 and 7–9 decide **what goes in the files**. A rule that fails them is
+omitted, and the omission is named in the file header — that is the record, not a
+console line. Stages 10–11 validate the compiler's **own output**, so they are the
+only stages that change the exit code: if a generated file cannot be read back and
+re-parsed, that is a defect in this compiler, not a finding about the
+specification. There is no stage 12 onward; the two runners take it from there.
 
 ### Why stage 5 exists
 
@@ -118,6 +141,39 @@ only the second one is what SeaTunnel will run.
 The DuckDB file has a second dimension: every check names relations. A statement
 that parses and reads a relation the job never binds is valid SQL that fails at
 run time, so stage 6 checks the relations as well as the text.
+
+---
+
+## 3a. Where a finding goes
+
+The console does not print findings, and that is a decision rather than an
+omission. A `BLOCK`, a `GOVERNANCE` finding, an `ASSUMPTION` and an `EDGE` are all
+statements about whether a *migration* is correct — and this program does not run
+migrations. It emits two files. The runner does.
+
+So each finding is carried into the artifact it concerns, where the person
+responsible for the run will meet it:
+
+| Was | Goes into | As |
+| --- | --- | --- |
+| `BLOCK` on a job | both file headers | the relation is listed as producing no job, **with the code and message that stopped it** |
+| `GOVERNANCE` | `duckdb.yaml`, in the job body | a `V-GOVERNANCE-*` check whose `notes` quote the finding |
+| `ASSUMPTION` | `duckdb.yaml`, in the job body | the `assumptions` list |
+| `EDGE` | `duckdb.yaml`, in the job body | the `notes` on the affected check |
+| type unknown without a catalog | `seatunnel.conf` | the type in the `ddl` block, which is written out |
+| shape came from the spec, not Oracle | both files | the `assumptions` list, so a reader knows the DDL is not evidence about the database |
+
+The general rule: **if a finding would change what a reader of the two files
+should believe, it goes in the file.** A finding nobody can see in the artifact
+they are about to run is not recorded, and a console list nobody reads is not
+better.
+
+What remains on the console is the receipt — which specification, which folder,
+which files, how big, how many jobs — plus one exception: a *generated file* that
+failed stage 5 or 6. That is a statement about this compiler, so it is printed
+and exits non-zero.
+
+This is also why `--strict` is gone. There is no severity left for it to gate on.
 
 ---
 
@@ -322,6 +378,73 @@ Each of these is a real Oracle→PostgreSQL difference.
 | A partitioned target needs its `DEFAULT` partition | emitted as a second `CREATE TABLE` | `build_target_ddl` |
 | A specification with `\#`, U+00A0 or tabs | named before parsing, exit 2 | `load_yaml` |
 | A catalog beside a `--spec` elsewhere | that one wins over the project root | `_load_optional_catalog` |
+| `scope.include` with `schema: "*"` | enumerates the catalog; without one, `SCOPE_WILDCARD_NEEDS_CATALOG` | `plan_jobs` |
+| `scope` names relations, all then excluded | `PLANNER_EMPTY_RESULT` names them | `plan_jobs` |
+| `scope` and rules match nothing at all | *not* an error: an empty migration is legitimate | `plan_jobs` |
+| Two relations resolving to one `target.table` | `TARGET_COLLISION`, rather than overwriting on load | `plan_jobs` |
+| A rule naming a table the catalog lacks | still migrated; its columns become assumptions | `plan_jobs` |
+| A table rule with its own `columns:` and no catalog | compiled; the shape is `SOURCE_SHAPE_FROM_SPEC` | `merge_inline_source_tables` |
+| A relation whose columns nothing describes | `SOURCE_SHAPE_UNKNOWN`, the job is blocked | `compile_job` |
+
+### Where the source shape comes from
+
+A migration compiles to a projection, and a projection is a list of columns. The
+specification says what to *do* to columns; it does not list the ones no rule
+touches, and those still have to migrate. So the compiler needs the source's
+**shape** — column names, Oracle types, character semantics, key — from one of
+three places, in order of trust. `need_catalog.md` is the full argument; this is
+the mechanism.
+
+| Source | What it is | How it is supplied |
+| --- | --- | --- |
+| a catalog | extracted from Oracle, authoritative | `--catalog`, or `catalog:` in the spec, or auto-searched |
+| the rule's own `columns:` | the spec stating the shape outright | `rules[].columns` / `rules[].primaryKey` |
+| the columns the rules name | a floor, not a plan | `SOURCE_SHAPE_FROM_RULES` |
+
+`merge_inline_source_tables` folds case 2 into the catalog before anything reads
+it, so the key check, the watermark and type inference all see one catalog
+regardless of where the shape came from. Synthesised tables carry
+`from_spec=True`, which is how a job knows to say so.
+
+**The catalog wins.** A catalog is read out of the database; an inline list is
+written by a person. When both exist for one relation the catalog is used and the
+inline list ignored, because a stale hand-written list silently governing a
+migration is worse than a redundant one.
+
+**A wildcard-schema rule's `columns:` is ignored.** It describes every table it
+matched, so its columns cannot be attributed to one relation without a catalog to
+say what the relations are. Wildcards genuinely require a catalog —
+`SCOPE_WILDCARD_NEEDS_CATALOG` says so rather than enumerating nothing.
+
+**A relation nothing describes is blocked.** No catalog, no `columns:`, no rule
+naming its columns means there is no projection to compile, so the job is
+`BLOCKED` with `SOURCE_SHAPE_UNKNOWN` and is not emitted. A job with no query must
+never become a job with an empty projection, which looks like a migration and
+loads nothing.
+
+### Why `jobs: 0` must never be silent
+
+The worst thing this compiler can emit is two empty files. It looks like a
+migration with nothing to do rather than one that could not be resolved, and a
+reader has no way to tell which.
+
+Three separate guards exist because "empty" has three different causes:
+
+| Cause | Truth | Reported by |
+| --- | --- | --- |
+| the catalog was filtered away by a wildcard-schema bug | a defect | the filter keeps wildcards — see below |
+| relations resolved, then all excluded or consumed | truthful, but invisible | `PLANNER_EMPTY_RESULT`, naming each |
+| the scope genuinely matched nothing | truthful and expected | nothing; an empty migration is legitimate |
+
+The first is the one that bit. `catalog_schemas` collected the *text* `"*"` as a
+wanted schema name. The filter then compared each table's real schema against
+`{"*"}`, matched none, and discarded the entire catalog — after which
+`catalog.expand()` had nothing to enumerate and `plan_jobs()` correctly produced
+nothing. Two functions in a chain, one of them doing exactly what it was written
+to do.
+
+A wildcard is not a schema. `catalog_schemas` now drops it, an empty result means
+"do not filter the catalog", and a `schema: "*"` scope enumerates it.
 
 ### The DuckDB translation edge cases
 
@@ -438,6 +561,19 @@ root, then the cwd. Compiling `--spec input/other.yaml` must pick up
 specification. An explicit `--catalog` is never searched for elsewhere, so a typo
 is reported instead of silently falling back.
 
+**No catalog is required.** `--catalog` is optional, and when it is absent the
+compiler reads each table rule's own `columns:` / `primaryKey:`, or falls back to
+the columns the rules themselves name. The receipt states what happened:
+
+```text
+catalog     : none supplied (0 table(s))
+```
+
+`input/hr-spec.yaml` is the worked example — no `catalog:` line, no catalog file
+beside it, and it compiles to both artifacts. `need_catalog.md` covers the rest:
+what the shape is needed for, why a rule cannot supply it on every table, and when
+an Oracle-extracted catalog is still the right answer.
+
 ## Reading a specification
 
 `load_yaml` raises `SpecReadError`, never a YAML traceback, and `main` prints it
@@ -469,18 +605,20 @@ punctuation or reformats indentation. They are the cases worth naming, because
 the parser's own message for each is actively misleading.
 
 ```powershell
-python src\transpiler.py --spec input\other.yaml --catalog input\other-catalog.yaml
-python src\transpiler.py --strict      # any blocking finding exits non-zero
-python src\transpiler.py --self-test   # dialects and HOCON/YAML, no inputs
+python src\transpiler.py                                              # the default spec
+python src\transpiler.py --spec input\my-new-migration.yaml           # any spec
+python src\transpiler.py --spec input\hr.yaml --catalog input\hr-catalog.yaml
+python src\transpiler.py --output-dir D:\build                        # a different root
+python src\transpiler.py --self-test                                  # no inputs needed
 ```
 
 `--catalog` is required whenever the specification names objects by wildcard
 (`SHOP.*`, `ORDERS_20*`, `column: AMOUNT`). Without it those rules cannot be
-enumerated and the compiler says so rather than compiling a subset.
+enumerated, so the relations they name are omitted rather than compiled as a
+partial guess.
 
-The compiler exits non-zero if either artifact fails re-validation, whether or not
-`--strict` is passed. Without `--strict` it always writes both files and reports
-what blocks, so the console output can be read.
+Exit codes: `0` compiled, `1` a generated file did not survive stage 5 or 6,
+`2` the specification could not be read. There is no severity gate — see §3a.
 
 ---
 
@@ -511,17 +649,20 @@ know any table by name.
 
 * **Execute anything.** Both artifacts are generated and every statement in them
   is proven to parse; execution is the two runners' job.
-* **Guess.** No catalog means no wildcard expansion. No type means `text` plus an
-  assumption. No partition bounds means a `DEFAULT` partition plus an admission.
-* **Partially execute.** A blocked job emits no query, no `.conf` entry and no
-  validation rules. It fails the run by being absent, which is visible.
-* **Write a third file.** Diagnostics go to stdout. If a finding matters enough
-  to need persisting, the rule that matters — a check, a sentinel column — goes in
-  one of the two files, not in a new document.
-* **Claim a behaviour it cannot prove.** `onMiss: fail-run`, `grain.uniqueness:
-  asserted`, `mask strategy=hash` and `change-aware` are all enforced by a
-  validation rule, because a projection cannot raise, cannot see a previous row
-  image, and cannot make a hash reversible.
+* **Guess.** No catalog means no wildcard expansion, and the relations it would
+  have supplied produce no job. No type means `text` plus a note in the file. No
+  partition bounds means a `DEFAULT` partition.
+* **Partially compile.** A relation the compiler could not resolve emits no job,
+  no `.conf` entry and no validation rules. It is named in the file header, so
+  its absence is visible rather than inferred from a row count.
+* **Write a third file, or print findings.** Both were removed. If a finding
+  matters enough to record, the rule that carries it — a check, an `assumptions`
+  entry, a type in a `ddl` block — goes in one of the two files. A finding printed
+  to a console and then scrolled away is not recorded anywhere.
+* **Judge the migration.** `onMiss: fail-run`, `grain.uniqueness: asserted`,
+  `mask strategy=hash` and `change-aware` are all expressed as validation rules,
+  because a projection cannot raise, cannot see a previous row image, and cannot
+  make a hash reversible — and answering them is DuckDB's job, not this one's.
 
 ---
 

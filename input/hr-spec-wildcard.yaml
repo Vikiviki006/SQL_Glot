@@ -1,0 +1,68 @@
+# Same migration as hr-spec.yaml, but with a wildcard schema.
+#
+#   scope.include: { schema: "*", name: ORDERS }
+#
+# The schema is a wildcard, so this cannot be resolved from the specification
+# alone: `*` names every schema, and only the catalog says which schemas exist.
+# input/catalog_orders_wildcard.yaml is required, and is named by `catalog:`
+# below so it is found without a command-line flag.
+#
+# With that catalog the wildcard resolves to every ORDERS it contains -- HR,
+# SALES and ARCHIVE -- and each becomes its own job with its own target. The
+# catalog deliberately also contains HR.DEPARTMENTS, which must NOT appear: the
+# wildcard is in the schema, not in the name.
+
+specVersion: 1
+schemaVersion: "5.1.0"
+dictionaryVersion: 1
+
+catalog: catalog_orders_wildcard.yaml
+
+engines:
+  source:
+    engine: oracle
+    version: "19"
+  target:
+    engine: postgresql
+    version: "17"
+
+scope:
+  include:
+    - objectClass: table
+      schema: "*"
+      name: ORDERS
+
+rules:
+  # A rule per schema, because each relation needs its own target. A single rule
+  # matching `schema: "*"` would resolve all three onto one `target.table`, and the
+  # compiler reports that as TARGET_COLLISION rather than letting them overwrite
+  # each other. Combining several sources into one target is a `cardinality/merge`
+  # step naming its sources, not a shared target name.
+  - id: hr-orders
+    match: { objectClass: table, schema: HR, name: ORDERS }
+    target: { schema: public, table: hr_orders }
+
+  - id: sales-orders
+    match: { objectClass: table, schema: SALES, name: ORDERS }
+    target: { schema: public, table: sales_orders }
+
+  - id: archive-orders
+    match: { objectClass: table, schema: ARCHIVE, name: ORDERS }
+    target: { schema: public, table: archive_orders }
+
+acceptance:
+  checks:
+    - row-count-exact
+
+run:
+  shape: migration
+  acquisition: snapshot
+  processing: bounded
+  rerun: restart
+  capture:
+    reader: logminer
+    startPosition: explicit-scn
+    scn: 123456789
+
+naming:
+  case: lower
