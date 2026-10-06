@@ -5,5 +5,3 @@ __pycache__/
 # Generated artifacts. Every file here is reproducible from the specification, and
 # a diff of two ~100KB generated files is noise on every recompile.
 output/
-
-echo "SQL_Glot/" >> .gitignore

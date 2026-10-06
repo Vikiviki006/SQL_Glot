@@ -8,25 +8,37 @@ meet them (AGENT.md §3a). There is no findings console to proxy, so there is
 no findings route either: POST /transpile returns the receipt the CLI would
 have printed plus the two generated files, and nothing else.
 
-Two routes:
+Four routes:
 
     GET  /health     {status, tool, version} -- the transpiler module's own
                      constants, so a version mismatch is visible from a curl.
 
     POST /transpile  multipart form: `spec`, the migration specification YAML
-                     (required); and an optional `spec_name` that overrides
-                     the specification's display name, which is also the name
-                     of its output folder. The catalog is no longer accepted
-                     as a route input -- the specification's own declared
-                     catalog or the project's default catalog.yaml is used.
-                     Answer: the ZIP bundle of one run's output folder
-                     (seatunnel.conf and duckdb.yaml) as a downloadable
-                     attachment, or an error payload on failure.
+                     (required); `catalog`, the Oracle source schema catalog
+                     YAML (optional -- a specification that states its own
+                     columns needs none, wildcard scope does); and an optional
+                     `spec_name` that overrides the specification's display
+                     name, which is also the name of its output folder.
+                     Answer: {ok, exit_code, receipt, artifacts: [{name,
+                     bytes, content}], storage, error?} -- `storage` on a
+                     successful run names the folder and the ZIP bundle the
+                     next stage picks up.
 
-Each request compiles in a private temp workspace: the upload is written
-into it, the compiler is pointed at it with explicit --spec and --output-dir,
-and the workspace is deleted whatever happens, so concurrent requests cannot
-see each other's files.
+    GET  /artifacts/{id}  the handoff file: the ZIP bundle of one run's
+                          output folder -- seatunnel.conf and duckdb.yaml at
+                          the root of the archive. 404 for an unknown id,
+                          410 for one whose TTL has passed.
+
+    GET  /rules      the active rulebook as JSON: transpiler.active_rules()
+                     when the transpiler provides it, otherwise the module's
+                     vocabulary constants exported from code. This route
+                     never answers 500 -- a rulebook with a note attached
+                     beats a stack trace.
+
+Each request compiles in a private temp workspace: the uploads are written
+into it, the compiler is pointed at it with explicit --spec, --catalog and
+--output-dir, and the workspace is deleted whatever happens, so concurrent
+requests cannot see each other's files.
 
 A successful run (exit 0) is then PERSISTED for the configured TTL, which
 is how the output reaches the next stage: `storage/<id>/` holds
@@ -40,6 +52,20 @@ one file, nothing on disk whose only job is to describe the other two.
 Exit 1 and exit 2 persist nothing -- a file that failed re-validation must
 not look like a deliverable, and an unreadable specification produced
 nothing to deliver.
+
+Expiry is enforced lazily: every request that touches storage first sweeps
+it and deletes folders older than the TTL. No background thread, no
+sweeper to supervise -- the next request after an expiry cleans up after
+the last one, and a TTL test needs only a folder with an old mtime. A
+config that exists but cannot be used raises ConfigError from every route
+that needs it: HTTP 500 with the message, while /health stays a liveness
+answer. The CLI entry point checks the same file and exits 2, as it does
+for an unreadable specification.
+
+Exit codes map the way a caller would guess: 0 -> 200; 2, the specification
+could not be read, -> 422 quoting the SpecReadError paragraph; 1, a generated
+file failed re-validation, -> 500, because that one is a statement about this
+compiler rather than about the specification.
 
 Run it with `python src/api.py` (serves on port 8000) or
 `python -m uvicorn src.api:app` from the project root.
@@ -60,7 +86,7 @@ import traceback
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -459,10 +485,13 @@ def health() -> Dict[str, Any]:
 @app.post("/transpile")
 async def transpile(
     spec: UploadFile = File(..., description="the migration specification YAML"),
+    catalog: Optional[UploadFile] = File(
+        None, description="the Oracle source schema catalog YAML; needed for wildcard scope"
+    ),
     spec_name: Optional[str] = Form(
         None, description="overrides the specification's display name"
     ),
-) -> Response:
+) -> JSONResponse:
     """Compile one specification and return the receipt plus both artifacts.
 
     On success the output is also persisted -- `storage` in the answer names
@@ -473,6 +502,7 @@ async def transpile(
     unknown must not be half-answered with a bundle nobody can find.
     """
     spec_bytes = await spec.read()
+    catalog_bytes = await catalog.read() if catalog is not None else None
 
     try:
         _config()
@@ -487,7 +517,7 @@ async def transpile(
         )
 
     payload = await run_in_threadpool(
-        _compile_in_workspace, spec_bytes, None, _spec_filename(spec_name)
+        _compile_in_workspace, spec_bytes, catalog_bytes, _spec_filename(spec_name)
     )
 
     if payload.get("exit_code") == 0:
@@ -498,15 +528,6 @@ async def transpile(
         if storage is not None:
             payload["storage"] = storage
 
-    # On success return the ZIP bundle as a downloadable file; on failure
-    # return the error payload as JSON.
-    if payload.get("exit_code") == 0 and storage is not None:
-        bundle_path = _storage_dir() / storage["id"] / f"{storage['id']}.zip"
-        return FileResponse(
-            bundle_path,
-            media_type="application/zip",
-            filename=bundle_path.name,
-        )
     return JSONResponse(
         status_code=_STATUS_BY_EXIT_CODE.get(payload["exit_code"], 500),
         content=payload,
@@ -556,6 +577,60 @@ def artifact_bundle(artifact_id: str) -> Response:
         media_type="application/zip",
         filename=bundle_path.name,
     )
+
+
+@app.get("/artifacts/{artifact_id}/manifest")
+def artifact_manifest(artifact_id: str) -> Response:
+    """The old manifest endpoint, kept only as a pointer to where it went.
+
+    There is no manifest any more: the TTL is config/config.yaml's
+    `storage.ttl_seconds`, a folder's age is its own mtime, and everything
+    else a manifest used to say was already in the POST /transpile answer
+    this bundle was born from. A next stage written against the old contract
+    deserves an answer that says where the information went rather than a
+    bare FastAPI "Not Found".
+    """
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "there is no manifest any more: the TTL is config/config.yaml "
+            "(storage.ttl_seconds), and the bundle's metadata -- id, path, "
+            f"expiry -- came back with POST /transpile. Try /artifacts/{artifact_id}"
+        ),
+    )
+
+
+@app.get("/rules")
+def rules() -> JSONResponse:
+    """The active rulebook, or the built-in vocabularies -- never a 500.
+
+    `active_rules()` is provided by the transpiler's dynamic rulebook; while
+    it is absent, and whenever it raises (a malformed rules file, say), the
+    module's own constants are exported instead with a note saying which
+    answer the caller got. A rulebook question always has an answer, and a
+    stack trace is not one.
+    """
+    try:
+        active_rules = getattr(transpiler, "active_rules", None)
+        if callable(active_rules):
+            return JSONResponse(
+                content={"source": "active_rules", "rules": _json_safe(active_rules())}
+            )
+        note = (
+            "transpiler.active_rules() does not exist yet; "
+            "exported the module's vocabulary constants instead."
+        )
+    except Exception as exc:
+        note = (
+            f"active_rules() raised {type(exc).__name__}: {exc}; "
+            "exported the module's vocabulary constants instead."
+        )
+    try:
+        fallback = _fallback_rulebook()
+    except Exception as exc:  # pragma: no cover - belt and braces
+        fallback = {}
+        note = f"{note} Exporting them raised {type(exc).__name__}: {exc}."
+    return JSONResponse(content={"source": "module-constants", "note": note, "rules": fallback})
 
 
 if __name__ == "__main__":
