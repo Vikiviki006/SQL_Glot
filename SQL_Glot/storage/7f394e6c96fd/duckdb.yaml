@@ -27,7 +27,7 @@
 # ==========================================================================
 duckdb_jobs_version: '1.0'
 produced_by: migration-transpiler 3.0.0
-source_of_truth: /tmp/transpiler-api-18_ui0y6/string.yaml
+source_of_truth: /tmp/transpiler-api-equ4kus6/string.yaml
 engine:
   name: duckdb
   dialect: duckdb
