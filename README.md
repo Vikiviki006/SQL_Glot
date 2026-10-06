@@ -141,10 +141,10 @@ migration-transpiler 3.0.0
   spec        : input\migration-spec.yaml
   output      : ...\output\migration-spec
 
-  seatunnel.conf  22 jobs    52 columns    68,858 bytes
-  duckdb.yaml     11 jobs   106 checks   100,308 bytes
+  seatunnel.conf  24 jobs    51 columns    80,238 bytes
+  duckdb.yaml     12 jobs   115 checks   111,287 bytes
 
-  11 of 12 target relations compiled
+  12 of 12 target relations compiled
 ```
 
 Exit codes: `0` compiled, `1` a generated file did not survive being read back and
@@ -403,7 +403,7 @@ AGENT.md                     the flow, the invariants, the edge-case table
 need_catalog.md              why a catalog file is (and is not) needed
 src/transpiler.py            every rule; one module
 requirements.txt             PyYAML and sqlglot
-input/hr-spec.yaml           HR.ORDERS -> public.orders. Self-sufficient: its
+input/hr-spec.yaml           admin.ORDERS -> public.orders. Self-sufficient: its
                              rule declares columns, so it needs no catalog.
 input/hr-spec-wildcard.yaml  schema: "*", so it does need one
 input/catalog_orders_wildcard.yaml   HR/SALES/ARCHIVE, each holding ORDERS

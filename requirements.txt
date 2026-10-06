@@ -11,3 +11,11 @@ sqlglot>=28.6
 # Do not install the optional `sqlglot[c]` compiled build while working on the
 # project-local ctunnel / pgcontract dialects: SQLGlot documents limitations with
 # runtime subclassed dialects in that mode.
+
+# FastAPI serves the four routes of src/api.py: health, transpile, artifact
+# download, rules.
+fastapi
+# uvicorn[standard] runs that app; `python src/api.py` starts it on port 8000.
+uvicorn[standard]
+# python-multipart parses the multipart form POST /transpile receives files in.
+python-multipart

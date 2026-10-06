@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import os
 import re
 import sys
 import textwrap
@@ -107,6 +108,19 @@ SEVERITY_ORDER = {"BLOCK": 0, "GOVERNANCE": 1, "ASSUMPTION": 2, "EDGE": 3, "INFO
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
+#
+# These sets and maps decide what this compiler accepts: which schema
+# versions, which operations, which join types, which Oracle types have a
+# PostgreSQL meaning. They are the **built-in defaults** -- the rulebook a
+# deployment ships, `config/rules.yaml`, replaces them at startup, and the
+# "Rulebook" section before `main()` explains how that file is found,
+# validated and installed. Read sites do not name the file: they read these
+# names, and `load_rulebook` points the names at whatever it loaded, so every
+# lookup consults the loaded rulebook when the code runs.
+#
+# Adding an operation therefore still starts here (AGENT.md section 11), and
+# then follows into `config/rules.yaml`, which must list it too or a
+# deployment shipping that file will keep blocking it.
 
 VALUE_OPS = {
     "cast",
@@ -154,6 +168,35 @@ KNOWN_CATEGORIES = {
     "change-aware",
     "key-declaration",
 }
+
+#: The operation gate: which operations a step may use under each category.
+#: `_validate_step` reads this and blocks anything else
+#: (STEP_OPERATION_UNKNOWN), because a shape this compiler does not implement
+#: must stop there rather than fall through to a compiler that would have to
+#: approximate it.
+#:
+#: This is the built-in default. The `categories` key of `config/rules.yaml`
+#: replaces it at startup like every other vocabulary here; it is given a name
+#: of its own so that one read site in `_validate_step` can consult the loaded
+#: rulebook the same way every other read site does. `value` allows `drop` on
+#: top of VALUE_OPS because a value step that drops the column is still a
+#: value step -- DROP_OPS is read separately by the projection loop and by the
+#: sensitive-handling check, which need to recognise a removal on its own.
+CATEGORY_OPERATIONS = {
+    "value": VALUE_OPS | DROP_OPS,
+    "derived": DERIVED_OPS,
+    "structural": STRUCTURAL_OPS,
+    "set": {"deduplicate", "distinct", "filter", "top-n"},
+    "cardinality": {"merge", "split"},
+    "relational": {"denormalise", "normalise"},
+}
+
+#: The categories that carry an operations gate -- the keys of the mapping
+#: above, taken before any rulebook can replace it. The rulebook loader
+#: requires a file to define all of them: removing one would not relax the
+#: rule for that category, it would switch the check off, and an unimplemented
+#: operation would then reach the compiler instead of stopping at validation.
+_GATED_CATEGORIES = tuple(CATEGORY_OPERATIONS)
 
 #: Categories that make a job snapshot-only rather than CDC-capable.
 SNAPSHOT_ONLY_CATEGORIES = {"set", "relational", "pivot"}
@@ -1146,15 +1189,12 @@ def _validate_step(step: Dict[str, Any], where: str, rule_id: str, diags: Diagno
     if category == "derived" and operation is None:
         diags.add("STEP_DERIVED_NO_OPERATION", "BLOCK", f"{where} is a derived step with no operation", rule_id=rule_id)
 
-    if operation and category in {"value", "derived", "structural", "set", "cardinality", "relational"}:
-        allowed = {
-            "value": VALUE_OPS | DROP_OPS,
-            "derived": DERIVED_OPS,
-            "structural": STRUCTURAL_OPS,
-            "set": {"deduplicate", "distinct", "filter", "top-n"},
-            "cardinality": {"merge", "split"},
-            "relational": {"denormalise", "normalise"},
-        }[category]
+    if operation and category in CATEGORY_OPERATIONS:
+        # The rulebook's `categories` key, not a table spelled out here: which
+        # operations a category allows is a rule a deployment must be able to
+        # change, and an operation missing from the list blocks rather than
+        # reaching the compiler (STEP_OPERATION_UNKNOWN).
+        allowed = CATEGORY_OPERATIONS[category]
         if operation not in allowed:
             diags.add(
                 "STEP_OPERATION_UNKNOWN",
@@ -5207,6 +5247,21 @@ def _spec_named_columns(spec: Dict[str, Any], plan: JobPlan) -> List[str]:
         if isinstance(value, str) and value and value not in found:
             found.append(value)
 
+    # Names the specification's own recipes produce. Column recipes run first
+    # (ADR-0098), so a row-selection reading one of these -- `line_total` from
+    # a derived arithmetic step -- reads the recipe's output, not a source
+    # column. Adding it to the projection anyway would register it twice, once
+    # as a base column and once as the recipe's own, and the job would block as
+    # DUPLICATE_TARGET_COLUMN: a job the artifacts then lack, for a filter the
+    # specification is entitled to write. The catalog path never had this
+    # problem -- a computed name is simply absent from what Oracle reports --
+    # so the floor has to say the same thing the catalog would.
+    produced = {
+        str((rule.get("target") or {}).get("column")).upper()
+        for rule in plan.column_rules + plan.table_rules
+        if (rule.get("target") or {}).get("column")
+    }
+
     for rule in plan.column_rules:
         match = rule.get("match") or {}
         add(match.get("column"))
@@ -5231,7 +5286,10 @@ def _spec_named_columns(spec: Dict[str, Any], plan: JobPlan) -> List[str]:
             if isinstance(aggregate.get("column"), str):
                 add(aggregate.get("column"))
             for value in collect_predicate_columns(step.get("predicate")):
-                add(value)
+                # A predicate on a produced name reads the recipe's value
+                # (ADR-0098), so it is not naming a source column here.
+                if str(value).upper() not in produced:
+                    add(value)
             order = step.get("orderSensitive") or {}
             for value in order.get("orderBy") or []:
                 add(value)
@@ -8850,12 +8908,694 @@ def _size(written: List[Path], name: str) -> str:
     return "  absent"
 
 
+# ---------------------------------------------------------------------------
+# Rulebook -- the vocabularies above, as a file a deployment ships
+# ---------------------------------------------------------------------------
+#
+# A vocabulary hardcoded in source is a list nobody can change without a
+# rebuild, and -- worse -- one nobody notices has gone stale. AGENT.md's rule
+# that a stale hand-written list silently governing a migration is worse than
+# a redundant one applies to rulebooks exactly as it applies to a catalog, so
+# the sets and maps in "Vocabulary" are the *built-in defaults* and
+# `config/rules.yaml` is the rulebook.
+#
+# Resolution order, once, at startup:
+#
+#   1. $TRANSPILER_RULES_FILE, when set -- an explicit path. Its not existing
+#      is an error rather than a fallback, for the same reason an explicit
+#      --catalog is never searched for elsewhere: a typo must be reported, not
+#      quietly answered with a different set of rules than the operator asked
+#      for.
+#   2. PROJECT_ROOT/config/rules.yaml, when that file is present.
+#   3. the built-in defaults, so that deleting the config leaves a working
+#      tool rather than a crash -- the defaults are complete.
+#
+# A file that *is* present but incomplete, mistyped or malformed raises
+# RuleBookError and never falls back. Compiling against the defaults while a
+# rulebook the deployment believes it shipped sits unread would produce
+# artifacts governed by vocabulary nobody approved -- the very failure this
+# file exists to prevent, arriving through the loader itself.
+#
+# Read sites consult the loaded rulebook at run time without naming it:
+# `load_rulebook` replaces the module globals, and every `in VALUE_OPS`,
+# `sorted(KNOWN_CATEGORIES)` and `ORACLE_TO_PG.get(...)` further down is looked
+# up when the code runs, not when it is defined.
+
+
+class RuleBookError(Exception):
+    """The rulebook file exists but cannot be used.
+
+    Raised for every shape or type problem in a rulebook, and for an explicit
+    path that is not there, so a bad file is named once, by the loader, with
+    the file and the key at fault. The alternatives are worse: a KeyError from
+    a read site names no file, and a silent fallback names no rulebook at all.
+    """
+
+
+#: The rulebook a deployment ships, and the variable that overrides where it
+#: is read from. Like every other default in this module the path is anchored
+#: to the project, not the working directory: this is the project's rulebook,
+#: and where the command was typed must not change which rules govern it.
+DEFAULT_RULEBOOK = PROJECT_ROOT / "config" / "rules.yaml"
+RULEBOOK_ENV_VAR = "TRANSPILER_RULES_FILE"
+
+#: The rulebook's schema: one key per vocabulary, and how each must be shaped.
+#:
+#: `set` keys are lists in the file -- YAML has no set type -- and load as
+#: Python sets, which is what the read sites' `in`, `|` and `sorted` expect.
+#: `map` keys are string-to-string mappings. `categories` carries its own
+#: shape, category -> list of operations, and is checked separately because it
+#: has to agree with `known_categories`.
+_RULEBOOK_SET_KEYS = (
+    "supported_schema_versions",
+    "known_categories",
+    "value_ops",
+    "derived_ops",
+    "drop_ops",
+    "structural_ops",
+    "snapshot_only_categories",
+    "elsewhere_handled_categories",
+    "pg_reserved_words",
+    "duckdb_unbindable_oracle_functions",
+)
+_RULEBOOK_MAP_KEYS = (
+    "predicate_operators",
+    "arithmetic_operators",
+    "pivot_aggregates",
+    "join_types",
+    "oracle_to_pg",
+    "duckdb_hash_by_oracle_algorithm",
+)
+_RULEBOOK_KEYS = frozenset(_RULEBOOK_SET_KEYS) | frozenset(_RULEBOOK_MAP_KEYS) | {"categories"}
+
+
+def _copy_rulebook(book: Dict[str, Any]) -> Dict[str, Any]:
+    """Fresh containers for every vocabulary in `book`.
+
+    Fresh because the loaded book is installed by replacing module globals and
+    because self_test reloads: a caller that edited a returned set would
+    otherwise be editing the defaults every later load falls back to.
+    """
+    copied: Dict[str, Any] = {key: set(book[key]) for key in _RULEBOOK_SET_KEYS}
+    copied.update({key: dict(book[key]) for key in _RULEBOOK_MAP_KEYS})
+    copied["categories"] = {name: set(ops) for name, ops in book["categories"].items()}
+    return copied
+
+
+def _validate_rulebook(book: Any, source: str) -> Dict[str, Any]:
+    """Check a rulebook's shape and types, and return it normalised.
+
+    Normalising here -- lists to sets, one shape per vocabulary -- is what lets
+    the read sites stay as they are: `operation in VALUE_OPS` wants a set,
+    `ORACLE_TO_PG.get` wants a mapping. Every failure raises RuleBookError
+    naming the file and the key, because a wrong type discovered later would
+    surface as a KeyError from a read site that knows nothing about rulebooks,
+    and a missing key would surface as a vocabulary silently reverted to the
+    built-in default.
+    """
+    if not isinstance(book, dict):
+        kind = type(book).__name__ if book is not None else "an empty document"
+        raise RuleBookError(
+            f"{source}: expected a mapping of vocabulary names at the document root, "
+            f"found {kind}.\n"
+            "  A rulebook is a mapping -- one key per vocabulary -- so it must start\n"
+            "  with a key such as `known_categories:` at column zero."
+        )
+
+    missing = sorted(key for key in _RULEBOOK_KEYS if key not in book)
+    if missing:
+        raise RuleBookError(
+            f"{source}: missing {missing}.\n"
+            "  A rulebook is complete. A vocabulary this file does not carry would fall\n"
+            "  back to the built-in default, and the deployment would ship a rulebook\n"
+            "  that does not say what it means."
+        )
+
+    # Checked before the two lists below are sorted: a scalar key of any other
+    # type would make `sorted` compare a str with an int, which is the kind of
+    # exception this loader exists to prevent.
+    odd_keys = [key for key in book if not isinstance(key, str)]
+    if odd_keys:
+        raise RuleBookError(
+            f"{source}: keys must be strings, found "
+            f"{[type(key).__name__ for key in odd_keys]}."
+        )
+
+    unknown = sorted(key for key in book if key not in _RULEBOOK_KEYS)
+    if unknown:
+        raise RuleBookError(
+            f"{source}: {unknown} {'is' if len(unknown) == 1 else 'are'} not a vocabulary "
+            f"this compiler reads.\n"
+            f"  Known keys: {sorted(_RULEBOOK_KEYS)}.\n"
+            "  An unknown key is a typo, and the vocabulary it was meant to override\n"
+            "  would go on governing the migration unnoticed."
+        )
+
+    normalised: Dict[str, Any] = {}
+    for key in _RULEBOOK_SET_KEYS:
+        value = book[key]
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            detail = (
+                f" with entries {sorted({type(item).__name__ for item in value})}"
+                if isinstance(value, list)
+                else f": {value!r}"[:120]
+            )
+            raise RuleBookError(
+                f"{source}: `{key}` must be a list of strings, found "
+                f"{type(value).__name__}{detail}."
+            )
+        normalised[key] = set(value)
+
+    for key in _RULEBOOK_MAP_KEYS:
+        value = book[key]
+        if not isinstance(value, dict) or any(
+            not isinstance(map_key, str) or not isinstance(map_value, str)
+            for map_key, map_value in (value.items() if isinstance(value, dict) else ())
+        ):
+            raise RuleBookError(
+                f"{source}: `{key}` must be a mapping of strings to strings, found "
+                f"{type(value).__name__}."
+            )
+        normalised[key] = dict(value)
+
+    categories = book["categories"]
+    if not isinstance(categories, dict):
+        raise RuleBookError(
+            f"{source}: `categories` must be a mapping of category -> list of operations, "
+            f"found {type(categories).__name__}."
+        )
+    for name, operations in categories.items():
+        if not isinstance(name, str) or name not in normalised["known_categories"]:
+            raise RuleBookError(
+                f"{source}: `categories` names `{name}`, which is not in "
+                f"`known_categories`.\n"
+                "  A specification cannot declare that category, so an operations list for\n"
+                "  it could never govern a step -- which means it is a typo, not a rule."
+            )
+        if not isinstance(operations, list) or any(not isinstance(op, str) for op in operations):
+            raise RuleBookError(
+                f"{source}: `categories.{name}` must be a list of strings, found "
+                f"{type(operations).__name__}."
+            )
+    absent = sorted(category for category in _GATED_CATEGORIES if category not in categories)
+    if absent:
+        raise RuleBookError(
+            f"{source}: `categories` has no entry for {absent}.\n"
+            "  Those are the categories `_validate_step` gates by operation. Omitting one\n"
+            "  would not relax its rule, it would switch the check off, and an\n"
+            "  unimplemented operation would then reach the compiler instead of blocking."
+        )
+
+    normalised["categories"] = {name: set(ops) for name, ops in categories.items()}
+    return normalised
+
+
+def _resolve_rulebook_path(explicit: Optional[Path] = None) -> Optional[Path]:
+    """Where to read the rulebook from, or None when there is no file to read.
+
+    None means *nothing was asked for*: the built-in defaults then stand. A
+    file that was asked for and is not there raises, because an explicit
+    rulebook is a deployment decision and a decision that cannot be found is
+    an error rather than an invitation to compile against something else.
+    """
+    if explicit is not None:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            raise RuleBookError(f"the rulebook {path} is not a file.")
+        return path
+
+    configured = os.environ.get(RULEBOOK_ENV_VAR)
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            raise RuleBookError(
+                f"{RULEBOOK_ENV_VAR} points at {path}, which is not a file.\n"
+                "  An explicit rulebook is never replaced by another one. Fix the path, or\n"
+                "  unset the variable to read config/rules.yaml instead."
+            )
+        return path
+
+    if DEFAULT_RULEBOOK.is_file():
+        return DEFAULT_RULEBOOK
+    return None
+
+
+def load_rulebook(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load a rulebook, install it as this module's vocabularies, return it.
+
+    This is what "loaded dynamically at startup" means: the install below
+    replaces every vocabulary global, so from this call on the read sites
+    consult this file. With no argument the resolution order above applies;
+    `path` is for a caller that knows exactly which rulebook it wants --
+    self_test proves an override with one.
+    """
+    global _RULEBOOK_ERROR
+
+    resolved = _resolve_rulebook_path(path)
+    if resolved is None:
+        book = _copy_rulebook(_BUILTIN_RULEBOOK)
+    else:
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuleBookError(
+                f"{resolved} is not valid UTF-8 ({exc}). Re-save it as UTF-8; the "
+                "vocabularies and the files this produces are UTF-8."
+            ) from None
+        except OSError as exc:
+            raise RuleBookError(f"{resolved} could not be read: {exc}") from None
+
+        try:
+            raw = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            # The specification reader's diagnosis, reused on purpose: it names
+            # the line, shows the offending text, and recognises the accidents a
+            # copy through a reformatting tool leaves behind -- which is what a
+            # hand-edited rulebook hits too. A raw scanner message would point at
+            # wherever parsing stopped rather than at what is wrong.
+            raise RuleBookError(
+                "the rulebook could not be parsed, and a rulebook that cannot be read\n"
+                "is not replaced by the built-in defaults:\n\n"
+                f"{_describe_yaml_failure(resolved, text, exc)}"
+            ) from None
+
+        book = _validate_rulebook(raw, str(resolved))
+
+    _install_rulebook(book)
+    _RULEBOOK_ERROR = None
+    return book
+
+
+def _install_rulebook(book: Dict[str, Any]) -> None:
+    """Point every vocabulary name in this module at one loaded rulebook.
+
+    The names are read when the code runs, not when it is defined, so one
+    assignment per vocabulary is the whole of "read sites consult the loaded
+    rulebook at runtime": all thirty-odd of them -- membership tests,
+    `sorted(...)`, `.get(...)` -- follow the file from the next call on,
+    without any of them naming a path.
+    """
+    global _RULEBOOK, SUPPORTED_SCHEMA_VERSIONS, KNOWN_CATEGORIES
+    global SNAPSHOT_ONLY_CATEGORIES, ELSEWHERE_HANDLED_CATEGORIES
+    global VALUE_OPS, DERIVED_OPS, DROP_OPS, STRUCTURAL_OPS, CATEGORY_OPERATIONS
+    global PREDICATE_OPERATORS, ARITHMETIC_OPERATORS, PIVOT_AGGREGATES, JOIN_TYPES
+    global ORACLE_TO_PG, PG_RESERVED_WORDS, DUCKDB_UNBINDABLE_ORACLE_FUNCTIONS
+    global DUCKDB_HASH_BY_ORACLE_ALGORITHM
+
+    _RULEBOOK = book
+    SUPPORTED_SCHEMA_VERSIONS = book["supported_schema_versions"]
+    KNOWN_CATEGORIES = book["known_categories"]
+    SNAPSHOT_ONLY_CATEGORIES = book["snapshot_only_categories"]
+    ELSEWHERE_HANDLED_CATEGORIES = book["elsewhere_handled_categories"]
+    VALUE_OPS = book["value_ops"]
+    DERIVED_OPS = book["derived_ops"]
+    DROP_OPS = book["drop_ops"]
+    STRUCTURAL_OPS = book["structural_ops"]
+    CATEGORY_OPERATIONS = book["categories"]
+    PREDICATE_OPERATORS = book["predicate_operators"]
+    ARITHMETIC_OPERATORS = book["arithmetic_operators"]
+    PIVOT_AGGREGATES = book["pivot_aggregates"]
+    JOIN_TYPES = book["join_types"]
+    ORACLE_TO_PG = book["oracle_to_pg"]
+    PG_RESERVED_WORDS = book["pg_reserved_words"]
+    DUCKDB_UNBINDABLE_ORACLE_FUNCTIONS = book["duckdb_unbindable_oracle_functions"]
+    DUCKDB_HASH_BY_ORACLE_ALGORITHM = book["duckdb_hash_by_oracle_algorithm"]
+
+
+def active_rules() -> Dict[str, Any]:
+    """The loaded rulebook as plain, JSON-safe data.
+
+    The one symbol another module may import: GET /rules serves this. Sets
+    become sorted lists so `json.dumps` takes it directly, and the result is a
+    copy, so a caller cannot edit the vocabulary this compiler runs with. A
+    rulebook that failed to load raises instead of exporting the built-in
+    defaults -- an endpoint called /rules must not answer with rules the
+    deployment never shipped.
+    """
+    if _RULEBOOK_ERROR is not None:
+        raise _RULEBOOK_ERROR
+    if _RULEBOOK is None:  # pragma: no cover - startup records an error instead
+        raise RuleBookError("no rulebook has been loaded")
+    exported: Dict[str, Any] = {key: sorted(_RULEBOOK[key]) for key in _RULEBOOK_SET_KEYS}
+    exported.update({key: dict(_RULEBOOK[key]) for key in _RULEBOOK_MAP_KEYS})
+    exported["categories"] = {name: sorted(ops) for name, ops in _RULEBOOK["categories"].items()}
+    return exported
+
+
+# Captured here, where every vocabulary is still the built-in default and
+# before the first load can replace it: once `load_rulebook` has run, the names
+# above hold a file's values, and a capture taken then would copy the previous
+# rulebook over itself -- the built-in default would stop being built in.
+_BUILTIN_RULEBOOK = _copy_rulebook(
+    {
+        "supported_schema_versions": SUPPORTED_SCHEMA_VERSIONS,
+        "known_categories": KNOWN_CATEGORIES,
+        "value_ops": VALUE_OPS,
+        "derived_ops": DERIVED_OPS,
+        "drop_ops": DROP_OPS,
+        "structural_ops": STRUCTURAL_OPS,
+        "snapshot_only_categories": SNAPSHOT_ONLY_CATEGORIES,
+        "elsewhere_handled_categories": ELSEWHERE_HANDLED_CATEGORIES,
+        "predicate_operators": PREDICATE_OPERATORS,
+        "arithmetic_operators": ARITHMETIC_OPERATORS,
+        "pivot_aggregates": PIVOT_AGGREGATES,
+        "join_types": JOIN_TYPES,
+        "oracle_to_pg": ORACLE_TO_PG,
+        "pg_reserved_words": PG_RESERVED_WORDS,
+        "duckdb_unbindable_oracle_functions": DUCKDB_UNBINDABLE_ORACLE_FUNCTIONS,
+        "duckdb_hash_by_oracle_algorithm": DUCKDB_HASH_BY_ORACLE_ALGORITHM,
+        "categories": CATEGORY_OPERATIONS,
+    }
+)
+
+#: The rulebook in force, as sets and mappings. `active_rules()` is its
+#: JSON-safe view; None only until the first successful load.
+_RULEBOOK: Optional[Dict[str, Any]] = None
+
+#: Recorded when a rulebook that exists could not be used, and cleared by the
+#: next successful load. The module still imports with it set, so the failure
+#: can be reported *by name* from the entry points -- `main` before anything
+#: compiles, `active_rules` before anything is served -- instead of as a
+#: traceback in the middle of an import, which would take the whole tool down
+#: without saying which file was at fault.
+_RULEBOOK_ERROR: Optional[RuleBookError] = None
+
+try:
+    load_rulebook()
+except RuleBookError as exc:
+    _RULEBOOK_ERROR = exc
+
+
+# ---------------------------------------------------------------------------
+# Service configuration
+# ---------------------------------------------------------------------------
+#
+# config/config.yaml is this tool's own service configuration: where a
+# compiled bundle is stored, how long it survives, and where the HTTP front
+# door listens. Like the rulebook it lives under config/, is read by THIS
+# module, and is never read anywhere else -- src/api.py asks this module for
+# it instead of opening the file itself, so one loader, one validation and
+# one error message cover both halves of the tool. That is what "the config
+# file belongs to the transpiler" means in practice: the service has
+# preferences, the transpiler has the file.
+#
+# Resolution order, on every call:
+#
+#   1. $TRANSPILER_CONFIG_FILE, when set -- an explicit path that is not a
+#      file is an error, for the same reason the rulebook's env var and an
+#      explicit --catalog are never quietly replaced by something else.
+#   2. PROJECT_ROOT/config/config.yaml, when present.
+#   3. the built-in defaults below, so deleting the file leaves a working
+#      tool rather than a crash.
+#
+# A file that exists but is malformed, mistyped or carries an unknown key
+# raises ConfigError and never falls back -- the rulebook's argument once
+# more: a deployment that shipped a config believes it is in force, and a
+# TTL or a port silently taken from defaults instead is the stale-file
+# failure arriving through the loader.
+#
+# The asymmetry with the rulebook is deliberate. A rulebook must be
+# COMPLETE -- it is a vocabulary, and a missing entry would silently change
+# what compiles -- so its loader rejects an incomplete file. A config may be
+# partial: each key has exactly one meaning, so a key the file omits is a
+# request for the documented default, not a gap. Unknown keys are errors in
+# both files, for the same reason: a typo must not be ignored.
+#
+# Read fresh on every `app_config()` call rather than once at import, also
+# deliberately. Config values govern runtime behaviour (TTL, storage path,
+# port), and an operator who fixes a file should not have to restart a
+# server for it to take effect -- which is also what makes the loader
+# testable against a live service. The rulebook cannot work that way: it IS
+# the module globals. The config has no globals to swap, and reading one
+# small YAML per request is cheaper than the restart it saves.
+
+
+class ConfigError(Exception):
+    """The config file exists but cannot be used.
+
+    Raised for every shape or type problem, for an unknown key, and for an
+    explicit path that is not there -- always naming the file and the key at
+    fault, because the alternatives name neither: a KeyError from a read site
+    knows nothing about config files, and a silent fallback means the
+    operator's settings never took effect without anything saying so.
+    """
+
+
+#: Where the config is read from, and the variable that overrides it.
+#: Anchored to the project like every other default here: this is the
+#: project's config, so where a command was typed must not change which
+#: settings govern it.
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
+CONFIG_ENV_VAR = "TRANSPILER_CONFIG_FILE"
+
+#: The complete configuration, and the shape every file is checked against.
+#: These values are what a deleted config falls back to, so they must be
+#: the ones a bare install is meant to run with -- `config/config.yaml`
+#: ships as exactly this, and a partial file merges over the same table.
+_DEFAULT_CONFIG: Dict[str, Any] = {
+    "storage": {
+        # Where persisted bundles live, relative to the project root when not
+        # absolute -- the same anchoring every default in this module has, so
+        # a server started from another directory still stores and sweeps the
+        # one folder its callers are told about.
+        "dir": "storage",
+        # Seconds a compiled bundle survives. Folder age is judged against
+        # this at read time, so changing it in the file applies to folders
+        # already on disk -- unlike the rulebook vocabularies, config has no
+        # state to re-time.
+        "ttl_seconds": 900,
+    },
+    "server": {
+        "host": "127.0.0.1",
+        "port": 8000,
+    },
+}
+
+
+def _copy_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Fresh nested containers, so a caller cannot edit the defaults.
+
+    The same reason `_copy_rulebook` exists: the default table is module
+    state, and self_test reloads -- a caller that sets `config["server"]
+    ["port"]` on one result must not be editing what every later load falls
+    back to.
+    """
+    return {section: dict(values) for section, values in config.items()}
+
+
+def _validate_config(value: Any, source: str) -> Dict[str, Any]:
+    """Check a config's shape and types, merge it over the defaults, return it.
+
+    Every failure raises ConfigError naming the file and the key, because a
+    wrong type found later would surface as a KeyError from a read site that
+    knows nothing about config files, and an unknown key would be ignored --
+    which is exactly the outcome an operator who mistyped a setting must
+    never get: their intended value quietly not in force.
+    """
+    if not isinstance(value, dict):
+        kind = type(value).__name__ if value is not None else "an empty document"
+        raise ConfigError(
+            f"{source}: expected a mapping of settings at the document root, "
+            f"found {kind}.\n"
+            "  A config is a mapping -- one key per section -- so it must start\n"
+            "  with a key such as `storage:` at column zero."
+        )
+
+    odd_keys = [key for key in value if not isinstance(key, str)]
+    if odd_keys:
+        raise ConfigError(
+            f"{source}: keys must be strings, found "
+            f"{[type(key).__name__ for key in odd_keys]}."
+        )
+
+    unknown = sorted(set(value) - set(_DEFAULT_CONFIG))
+    if unknown:
+        raise ConfigError(
+            f"{source}: {unknown} {'is' if len(unknown) == 1 else 'are'} not a section "
+            f"this tool reads.\n"
+            f"  Known sections: {sorted(_DEFAULT_CONFIG)}.\n"
+            "  An unknown section is a typo, and the setting it was meant to change\n"
+            "  would go on being the default, unnoticed."
+        )
+
+    normalised = _copy_config(_DEFAULT_CONFIG)
+
+    for section, defaults in _DEFAULT_CONFIG.items():
+        supplied = value.get(section, {})
+        if not isinstance(supplied, dict):
+            raise ConfigError(
+                f"{source}: `{section}` must be a mapping of settings, found "
+                f"{type(supplied).__name__}."
+            )
+        odd = [key for key in supplied if not isinstance(key, str)]
+        if odd:
+            raise ConfigError(
+                f"{source}: `{section}` keys must be strings, found "
+                f"{[type(key).__name__ for key in odd]}."
+            )
+        section_unknown = sorted(set(supplied) - set(defaults))
+        if section_unknown:
+            raise ConfigError(
+                f"{source}: {section_unknown} "
+                f"{'is' if len(section_unknown) == 1 else 'are'} not a setting under "
+                f"`{section}`.\n"
+                f"  Known keys: {sorted(defaults)}.\n"
+                "  An unknown key is a typo, and the setting it was meant to change\n"
+                "  would go on being the default, unnoticed."
+            )
+        normalised[section].update(supplied)
+
+    # Type checks last, against the merged values, so a key omitted from the
+    # file is validated too -- the defaults must be held to the same
+    # contract a written-down value is, or a bad default would only ever
+    # fail in the field.
+    ttl = normalised["storage"]["ttl_seconds"]
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        raise ConfigError(
+            f"{source}: `storage.ttl_seconds` must be a positive whole number of "
+            f"seconds, found {ttl!r}."
+        )
+    directory = normalised["storage"]["dir"]
+    if not isinstance(directory, str) or not directory.strip():
+        raise ConfigError(
+            f"{source}: `storage.dir` must be a non-empty path, found {directory!r}."
+        )
+    host = normalised["server"]["host"]
+    if not isinstance(host, str) or not host.strip():
+        raise ConfigError(
+            f"{source}: `server.host` must be a non-empty hostname, found {host!r}."
+        )
+    port = normalised["server"]["port"]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError(
+            f"{source}: `server.port` must be a whole number between 1 and 65535, "
+            f"found {port!r}."
+        )
+    return normalised
+
+
+def _resolve_config_path(explicit: Optional[Path] = None) -> Optional[Path]:
+    """Where to read the config from, or None when there is no file to read.
+
+    None means *nothing was asked for*: the defaults then stand. A file that
+    was asked for and is not there raises -- an explicit config is a
+    deployment decision, and a decision that cannot be found is an error
+    rather than an invitation to run on defaults.
+    """
+    if explicit is not None:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            raise ConfigError(f"the config {path} is not a file.")
+        return path
+
+    configured = os.environ.get(CONFIG_ENV_VAR)
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            raise ConfigError(
+                f"{CONFIG_ENV_VAR} points at {path}, which is not a file.\n"
+                "  An explicit config is never replaced by another one. Fix the path, or\n"
+                "  unset the variable to read config/config.yaml instead."
+            )
+        return path
+
+    if DEFAULT_CONFIG.is_file():
+        return DEFAULT_CONFIG
+    return None
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read the config, validate it, return it merged over the defaults.
+
+    With no argument the resolution order above applies; `path` is for a
+    caller that knows exactly which config it wants -- self_test proves the
+    merge and the rejections with temporary files.
+    """
+    resolved = _resolve_config_path(path)
+    if resolved is None:
+        return _copy_config(_DEFAULT_CONFIG)
+
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{resolved} is not valid UTF-8 ({exc}). Re-save it as UTF-8; the config "
+            "and the files this produces are UTF-8."
+        ) from None
+    except OSError as exc:
+        raise ConfigError(f"{resolved} could not be read: {exc}") from None
+
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        # The specification reader's diagnosis again, on purpose: it names the
+        # line, shows the offending text, and recognises the accidents a copy
+        # through a reformatting tool leaves behind -- which is what a
+        # hand-edited config hits too.
+        raise ConfigError(
+            "the config could not be parsed, and a config that cannot be read\n"
+            "is not replaced by the defaults:\n\n"
+            f"{_describe_yaml_failure(resolved, text, exc)}"
+        ) from None
+
+    return _validate_config(raw, str(resolved))
+
+
+def app_config() -> Dict[str, Any]:
+    """The configuration in force, read fresh from disk on every call.
+
+    The one symbol another module may import: src/api.py's storage, TTL and
+    server settings all come from here, so the config file belongs to the
+    transpiler and the service simply asks. A config that failed to load
+    raises ConfigError instead of returning the defaults -- a caller must
+    never believe it is running with a file the deployment shipped when it
+    is not.
+    """
+    return load_config()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if _RULEBOOK_ERROR is not None:
+        # A rulebook that exists but cannot be used stops the run before
+        # anything compiles. Falling back to the built-in defaults here would
+        # emit artifacts governed by a vocabulary the deployment believes it
+        # replaced -- exactly the stale list AGENT.md calls worse than a
+        # redundant one. Exit 2 is the code this module already uses for an
+        # input file that could not be read.
+        print(f"\n{_RULEBOOK_ERROR}\n", file=sys.stderr)
+        print("  No output was written.", file=sys.stderr)
+        return 2
+
+    try:
+        # Every entry point reads this tool's own input files before acting.
+        # The CLI consumes none of these settings today, but a broken config
+        # must be named by the entry point an operator actually ran -- with
+        # the file and the key at fault -- rather than first surfacing as a
+        # 500 from a later HTTP request against the same file.
+        app_config()
+    except ConfigError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        print("  No output was written.", file=sys.stderr)
+        return 2
+
     try:
         return _main(argv)
     except SpecReadError as exc:
         # A specification that cannot be read is the reader's problem to fix, not a
         # crash. One clear paragraph naming the cause beats a scanner traceback.
+        print(f"\n{exc}\n", file=sys.stderr)
+        print("  No output was written.", file=sys.stderr)
+        return 2
+    except RuleBookError as exc:
+        # Same treatment for a rulebook: it is an input like the specification,
+        # so an unreadable one is a message and an exit code, never a traceback.
+        print(f"\n{exc}\n", file=sys.stderr)
+        print("  No output was written.", file=sys.stderr)
+        return 2
+    except ConfigError as exc:
+        # Belt and braces: the pre-flight check above is where a broken config
+        # is expected to surface, but one raised mid-run gets the same
+        # treatment -- a message and exit 2, never a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
         print("  No output was written.", file=sys.stderr)
         return 2
@@ -9500,7 +10240,327 @@ def self_test() -> int:
         if not ok:
             failures += 1
 
-    print(f"\nself-test: {len(cases) + 30 - failures}/{len(cases) + 30} passed")
+        # A filter on a computed value (ADR-0098) must compile WITHOUT a
+        # catalog. The floor used to read the predicate's `line_total` as a
+        # source column and register it twice -- once as a base column, once
+        # as the derived recipe's own output -- so the job blocked as
+        # DUPLICATE_TARGET_COLUMN and the artifacts silently lacked the job.
+        # The assertions are on the job's own state and on the code list:
+        # "it compiled" would pass for a job that lost its filter.
+        adr_path = tmp_path / "adr-0098-spec.yaml"
+        adr_path.write_text(
+            'schemaVersion: "5.1.0"\n'
+            "engines:\n"
+            "  source: { engine: oracle }\n"
+            "  target: { engine: postgresql }\n"
+            "scope:\n"
+            "  include:\n"
+            "    - { objectClass: table, schema: SHOP, name: ORDER_LINE }\n"
+            "rules:\n"
+            "  - id: line-total\n"
+            "    match: { objectClass: table, schema: SHOP, name: ORDER_LINE }\n"
+            '    target: { column: line_total, type: "numeric(14,2)" }\n'
+            "    steps:\n"
+            "      - { category: derived, operation: arithmetic, inputs: [QTY, UNIT_PRICE], "
+            "parameters: { operator: multiply } }\n"
+            "  - id: lines-with-value\n"
+            "    match: { objectClass: table, schema: SHOP, name: ORDER_LINE }\n"
+            "    steps:\n"
+            "      - { category: row-selection, predicate: { column: line_total, "
+            "comparison: gt, literal: 0 } }\n"
+            "acceptance:\n"
+            "  checks: [row-count-exact]\n"
+            "run:\n"
+            "  acquisition: snapshot\n",
+            encoding="utf-8",
+        )
+        adr = compile_all(load_yaml(adr_path), adr_path, None, None)
+        adr_codes = {d.code for j in adr["jobs"] for d in j.diagnostics.items}
+        adr_jobs = adr["jobs"]
+        adr_query = adr_jobs[0].query or "" if adr_jobs else ""
+        ok = (
+            len(adr_jobs) == 1
+            and adr_jobs[0].status != "BLOCKED"
+            and adr_jobs[0].query is not None
+            and "DUPLICATE_TARGET_COLUMN" not in adr_codes
+            and "line_total" in adr_query
+        )
+        print(f"  {'PASS' if ok else 'FAIL'}  a filter on a derived value compiles without a catalog")
+        if not ok:
+            failures += 1
+            print(f"        codes {sorted(adr_codes)}, statuses {[j.status for j in adr_jobs]}")
+
+    # The rulebook. The vocabularies live in config/rules.yaml, and these
+    # checks prove the *file* governs rather than the constants in this module:
+    # the default drives a real compile, an override loaded from a temporary
+    # file changes a validation outcome, and a file that cannot be used raises
+    # by name instead of falling back to the defaults or crashing the loader.
+    # Every assertion is on SQL text or a diagnostic code -- "it compiled"
+    # would pass for a rulebook that had lost an operation and taken the
+    # transformation with it.
+    import json
+
+    # Kept in step with the checks printed in this block; the summary line
+    # below counts them by name so a new check cannot be forgotten there.
+    RULEBOOK_CASES = 6
+
+    with tempfile.TemporaryDirectory() as tmp:
+        rulebook_spec = Path(tmp) / "rulebook-spec.yaml"
+        rulebook_spec.write_text(
+            'schemaVersion: "5.1.0"\n'
+            "engines:\n"
+            "  source: { engine: oracle }\n"
+            "  target: { engine: postgresql }\n"
+            "scope:\n"
+            "  include:\n"
+            "    - { objectClass: table, schema: HR, name: ORDERS }\n"
+            "rules:\n"
+            "  - id: orders-table\n"
+            "    match: { objectClass: table, schema: HR, name: ORDERS }\n"
+            "    target: { schema: public, table: orders }\n"
+            "    columns:\n"
+            '      - { name: ORDER_ID, type: "NUMBER(10)", nullable: false }\n'
+            '      - { name: NAME, type: "VARCHAR2(40)" }\n'
+            "    primaryKey: [ORDER_ID]\n"
+            "  - id: name-is-trimmed\n"
+            "    match: { objectClass: column, schema: HR, name: ORDERS, column: NAME }\n"
+            "    steps:\n"
+            "      - { category: value, operation: trim }\n"
+            "acceptance:\n"
+            "  checks: [row-count-exact]\n"
+            "run:\n"
+            "  acquisition: snapshot\n",
+            encoding="utf-8",
+        )
+        active = active_rules()
+
+        # (a) The default rulebook drives a real path. `trim` is a value
+        # operation in the loaded rulebook and the job's projection has to say
+        # TRIM -- the SQL is the evidence, and the absence of
+        # STEP_OPERATION_UNKNOWN is the validation half of the same claim.
+        default_run = compile_all(load_yaml(rulebook_spec), rulebook_spec, None, None)
+        default_query = default_run["jobs"][0].query if default_run["jobs"] else None
+        default_codes = {d.code for d in default_run["diagnostics"].items}
+        ok = (
+            default_query is not None
+            and "TRIM(" in default_query
+            and "trim" in active["categories"]["value"]
+            and "STEP_OPERATION_UNKNOWN" not in default_codes
+        )
+        print(f"  {'PASS' if ok else 'FAIL'}  the default rulebook drives a real compile")
+        if not ok:
+            failures += 1
+            print(f"        codes {sorted(default_codes)}")
+            print(f"        {default_query}")
+
+        # (b) An override changes validation. Taking `trim` out of the `value`
+        # gate in a temporary rulebook has to block the very same step, and
+        # loading it through the environment variable proves that variable
+        # wins over the project's own config rather than being merged with it.
+        override = json.loads(json.dumps(active))
+        override["categories"]["value"] = [
+            op for op in override["categories"]["value"] if op != "trim"
+        ]
+        override_path = Path(tmp) / "override-rules.yaml"
+        override_path.write_text(yaml.safe_dump(override, sort_keys=False), encoding="utf-8")
+
+        saved_rulebook_env = os.environ.get(RULEBOOK_ENV_VAR)
+        narrow_codes: set = set()
+        try:
+            os.environ[RULEBOOK_ENV_VAR] = str(override_path)
+            load_rulebook()
+            narrow_run = compile_all(load_yaml(rulebook_spec), rulebook_spec, None, None)
+            # `.blocking`, not every diagnostic: the claim is that the step
+            # *blocks*, and a rulebook that only warned would ship it.
+            narrow_codes = {d.code for d in narrow_run["diagnostics"].blocking}
+            ok = (
+                "STEP_OPERATION_UNKNOWN" in narrow_codes
+                and "trim" not in active_rules()["categories"]["value"]
+            )
+        except Exception as exc:  # noqa: BLE001 - a wrong exception fails the check, not the suite
+            ok = False
+            narrow_codes = {f"WRONG EXCEPTION {type(exc).__name__}: {exc}"}
+        finally:
+            # Back to the project's own rulebook: whatever the override said,
+            # everything after this point compiles against the shipped rules.
+            if saved_rulebook_env is None:
+                os.environ.pop(RULEBOOK_ENV_VAR, None)
+            else:
+                os.environ[RULEBOOK_ENV_VAR] = saved_rulebook_env
+            load_rulebook()
+        print(
+            f"  {'PASS' if ok else 'FAIL'}  an override rulebook blocks the step its default allowed"
+        )
+        if not ok:
+            failures += 1
+            print(f"        codes {sorted(narrow_codes)}")
+
+        # (c) A rulebook that exists but cannot be used raises the named
+        # error. Two ways to be unusable: not parseable at all, and parseable
+        # with the wrong type for a key. Neither may be swallowed into a
+        # silent fallback to the defaults, and neither may reach the caller as
+        # a raw PyYAML or KeyError traceback.
+        malformed_path = Path(tmp) / "malformed-rules.yaml"
+        malformed_path.write_text("value_ops: [cast, trim\n", encoding="utf-8")
+        wrong_type = json.loads(json.dumps(active))
+        wrong_type["value_ops"] = "cast"  # a scalar where a list belongs
+        wrong_type_path = Path(tmp) / "wrong-type-rules.yaml"
+        wrong_type_path.write_text(yaml.safe_dump(wrong_type, sort_keys=False), encoding="utf-8")
+
+        malformed_cases = [
+            (
+                "a malformed rulebook raises RuleBookError, not a YAML traceback",
+                malformed_path,
+                "is not valid YAML",
+            ),
+            (
+                "a rulebook with the wrong type for a key raises RuleBookError",
+                wrong_type_path,
+                "`value_ops` must be a list of strings",
+            ),
+        ]
+        for label, path, expected in malformed_cases:
+            try:
+                load_rulebook(path)
+                message = ""
+            except RuleBookError as exc:
+                message = str(exc)
+            except Exception as exc:  # noqa: BLE001
+                message = f"WRONG EXCEPTION {type(exc).__name__}: {exc}"
+            ok = expected in message
+            print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+            if not ok:
+                failures += 1
+                print(f"        expected {expected!r} in: {message[:300] or '<no error raised>'}")
+
+        # A rejected rulebook must leave the one in force untouched: the
+        # failure is reported, not resolved by quietly swapping vocabularies.
+        load_rulebook()
+        ok = active_rules() == active
+        print(f"  {'PASS' if ok else 'FAIL'}  a rejected rulebook leaves the loaded one in force")
+        if not ok:
+            failures += 1
+
+        # GET /rules serves this, and every vocabulary is a set -- which JSON
+        # cannot encode. Sorted lists make it servable and make the response
+        # stable between calls.
+        try:
+            payload = json.dumps(active_rules())
+            exported = json.loads(payload)
+            ok = (
+                isinstance(exported["value_ops"], list)
+                and exported["value_ops"] == sorted(exported["value_ops"])
+                and isinstance(exported["categories"]["value"], list)
+                and "trim" in exported["categories"]["value"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            payload = f"WRONG EXCEPTION {type(exc).__name__}: {exc}"
+        print(f"  {'PASS' if ok else 'FAIL'}  active_rules() is JSON-safe for GET /rules")
+        if not ok:
+            failures += 1
+            print(f"        {payload[:300]}")
+
+    # The config loader gets the same treatment the rulebook block above got:
+    # prove it loads what ships, prove a partial file merges over the
+    # defaults, and prove the two ways to be unusable -- an unknown key and a
+    # wrong type -- raise ConfigError by name rather than being ignored (an
+    # unknown key) or crashing a read site later (a wrong type). A malformed
+    # file must reach the caller as the named error, not a PyYAML traceback.
+    # Kept in step with the checks printed in this block; the summary line
+    # below counts them by name so a new check cannot be forgotten there.
+    CONFIG_CASES = 5
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # (a) What ships loads. The assertion is on shape, not on values: a
+        # deployment may have edited config/config.yaml, and a self-test that
+        # pinned the shipped numbers would fail for the operator who used the
+        # file exactly as intended.
+        try:
+            loaded = app_config()
+            ok = (
+                set(loaded) == set(_DEFAULT_CONFIG)
+                and set(loaded["storage"]) == set(_DEFAULT_CONFIG["storage"])
+                and set(loaded["server"]) == set(_DEFAULT_CONFIG["server"])
+            )
+            detail = str(loaded)[:300]
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            detail = f"WRONG EXCEPTION {type(exc).__name__}: {exc}"
+        print(f"  {'PASS' if ok else 'FAIL'}  the project's config loads with a complete shape")
+        if not ok:
+            failures += 1
+            print(f"        {detail}")
+
+        # (b) A partial config is legal and merges over the defaults: this is
+        # the deliberate asymmetry with the rulebook, and the case that would
+        # silently run the wrong TTL if the merge were missing.
+        partial_path = Path(tmp) / "partial-config.yaml"
+        partial_path.write_text("storage:\n  ttl_seconds: 60\n", encoding="utf-8")
+        try:
+            partial = load_config(partial_path)
+            ok = (
+                partial["storage"]["ttl_seconds"] == 60
+                and partial["storage"]["dir"] == _DEFAULT_CONFIG["storage"]["dir"]
+                and partial["server"] == _DEFAULT_CONFIG["server"]
+            )
+            detail = str(partial)[:300]
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            detail = f"WRONG EXCEPTION {type(exc).__name__}: {exc}"
+        print(f"  {'PASS' if ok else 'FAIL'}  a partial config fills the rest from the defaults")
+        if not ok:
+            failures += 1
+            print(f"        {detail}")
+
+        # (c) Two ways to be unusable, each raising by name with the key in
+        # the message: an unknown key would be IGNORED if accepted (the typo
+        # keeps its default, unnoticed), and a wrong type would survive the
+        # merge only to explode at a read site that names no config file.
+        unknown_path = Path(tmp) / "unknown-key-config.yaml"
+        unknown_path.write_text("storage:\n  ttl: 60\n", encoding="utf-8")
+        wrong_type_path = Path(tmp) / "wrong-type-config.yaml"
+        wrong_type_path.write_text("storage:\n  ttl_seconds: sixty\n", encoding="utf-8")
+        malformed_path = Path(tmp) / "malformed-config.yaml"
+        malformed_path.write_text("storage: [ttl_seconds: 60\n", encoding="utf-8")
+
+        config_cases = [
+            (
+                "an unknown config key raises ConfigError, not a silent default",
+                unknown_path,
+                "not a setting under `storage`",
+            ),
+            (
+                "a wrong config type raises ConfigError, not a later KeyError",
+                wrong_type_path,
+                "`storage.ttl_seconds` must be a positive whole number",
+            ),
+            (
+                "a malformed config raises ConfigError, not a YAML traceback",
+                malformed_path,
+                "is not valid YAML",
+            ),
+        ]
+        for label, path, expected in config_cases:
+            try:
+                load_config(path)
+                message = ""
+            except ConfigError as exc:
+                message = str(exc)
+            except Exception as exc:  # noqa: BLE001
+                message = f"WRONG EXCEPTION {type(exc).__name__}: {exc}"
+            ok = expected in message
+            print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+            if not ok:
+                failures += 1
+                print(f"        expected {expected!r} in: {message[:300] or '<no error raised>'}")
+
+    # `cases` is the specification-reading list above; the base count covers
+    # the checks outside it (it grew from 30 to 31 when the ADR-0098
+    # filter-on-a-derived-value check was added), and RULEBOOK_CASES and
+    # CONFIG_CASES are the two blocks that follow.
+    total = len(cases) + 31 + RULEBOOK_CASES + CONFIG_CASES
+    print(f"\nself-test: {total - failures}/{total} passed")
     return 1 if failures else 0
 
 

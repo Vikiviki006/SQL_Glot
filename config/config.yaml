@@ -1,0 +1,41 @@
+﻿# config/config.yaml -- the service configuration
+#
+# The transpiler owns this file: `app_config` in src/transpiler.py is the
+# only reader, and src/api.py asks that function rather than opening the
+# file itself -- one loader, one validation, one error message for both
+# halves of the tool. (The rulebook is its sibling: config/rules.yaml holds
+# what the compiler *accepts*, this file holds how the service *runs*.)
+#
+# Resolution order, read fresh on every call so an edit takes effect without
+# a restart:
+#
+#   1. $TRANSPILER_CONFIG_FILE, when set -- an explicit path that is not a
+#      file is an error, never a quiet fall back to this one.
+#   2. PROJECT_ROOT/config/config.yaml -- this file.
+#   3. the built-in defaults in src/transpiler.py, so deleting this file
+#      leaves a working tool rather than a crash.
+#
+# A partial file is fine: whatever you omit keeps its default. An unknown
+# key is an error (ConfigError, exit 2 on the CLI, HTTP 500 from the API) --
+# a typo that is silently ignored is a setting quietly not in force, which
+# is the failure this strictness exists to prevent.
+
+#: Where a compiled bundle is persisted after POST /transpile: one folder
+#: per request, holding seatunnel.conf, duckdb.yaml and the <id>.zip the
+#: next stage downloads from GET /artifacts/<id>. Relative to the project
+#: root, so a server started from any directory stores to the same place.
+storage:
+  dir: storage
+
+  #: How long a bundle survives, in seconds -- 900 is the agreed 15 minutes
+  #: between "the next stage picks the zip up" and "the folder is gone".
+  #: Age is measured against the folder's mtime at read time, so changing
+  #: this value applies to folders already on disk.
+  ttl_seconds: 900
+
+#: What `python src/api.py` listens on. `python -m uvicorn src.api:app`
+#: ignores this file's server section -- uvicorn's own flags win there, as
+#: they do for every ASGI app.
+server:
+  host: 127.0.0.1
+  port: 8000
