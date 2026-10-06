@@ -1,0 +1,39 @@
+# Oracle source metadata for the wildcard-schema scenario.
+#
+# Three schemas each hold an ORDERS table, so `scope.include: { schema: "*",
+# name: ORDERS }` must resolve to all three. DEPARTMENTS exists to prove the
+# wildcard is in the *schema*, not the name: it is never migrated.
+
+source: Oracle HR/SALES/ARCHIVE
+tables:
+  - schema: HR
+    name: ORDERS
+    primaryKey: [ORDER_ID]
+    columns:
+      - { name: ORDER_ID,    type: "NUMBER(10)",      nullable: false }
+      - { name: CUSTOMER_ID, type: "NUMBER(10)",      nullable: false }
+      - { name: ORDER_DATE,  type: "DATE",            nullable: false }
+      - { name: AMOUNT,      type: "NUMBER(12,2)" }
+      - { name: STATUS,      type: "VARCHAR2(20)" }
+
+  - schema: SALES
+    name: ORDERS
+    primaryKey: [ORDER_ID]
+    columns:
+      - { name: ORDER_ID,   type: "NUMBER(10)", nullable: false }
+      - { name: ORDER_DATE, type: "DATE",       nullable: false }
+      - { name: AMOUNT,     type: "NUMBER(12,2)" }
+
+  - schema: ARCHIVE
+    name: ORDERS
+    primaryKey: [ORDER_ID]
+    columns:
+      - { name: ORDER_ID,   type: "NUMBER(10)", nullable: false }
+      - { name: ORDER_DATE, type: "DATE" }
+
+  - schema: HR
+    name: DEPARTMENTS
+    primaryKey: [DEPARTMENT_ID]
+    columns:
+      - { name: DEPARTMENT_ID, type: "NUMBER(10)", nullable: false }
+      - { name: DEPARTMENT_NAME, type: "VARCHAR2(60)" }

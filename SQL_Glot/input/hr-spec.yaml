@@ -1,0 +1,71 @@
+# specVersion: 1
+# schemaVersion: 5.1.0
+# dictionaryVersion: 1
+# engines:
+#   source:
+#     engine: oracle
+#     version: 26ai
+#   target:
+#     engine: postgresql
+#     version: "17"
+# scope:
+#   include:
+#     - objectClass: table
+#       schema: admin
+#       name: ORDERS
+# defaults:
+#   emptyStringIsNull: "null"
+#   charLengthSemantics: characters
+#   collation: binary
+#   numberWithoutPrecision: from-profile
+#   dateWithTimeComponent: date-if-profile-proves-no-time
+#   timestampWithTimeZone: split-offset
+#   fractionalSecondsBeyondMicroseconds: round
+#   json: jsonb
+# acceptance:
+#   checks:
+#     - row-count-exact
+#     - chunk-digest-match
+#   maxQuarantinedRows: 0
+# run:
+#   shape: migration
+#   acquisition: snapshot
+#   processing: bounded
+#   rerun: replace-scope
+# naming:
+#   schema:
+#     policy: map
+#     map:
+#       - source: admin
+#         target: public
+#   case: lower
+#   onReservedOrSpecial: quote
+#   onTooLong: shorten-with-hash
+#   packageMembers: prefix
+# rules:
+#   - id: orders-table
+#     match:
+#       objectClass: table
+#       schema: admin
+#       name: ORDERS
+#     target:
+#       schema: public
+#       table: orders
+#     # The rule states its own relation's shape, so this specification compiles
+#     # with no catalog. A projection is a list of columns and a rule only names
+#     # the columns it transforms -- without this list nothing describes
+#     # admin.ORDERS, and the job is blocked as SOURCE_SHAPE_UNKNOWN rather than
+#     # emitted with an empty projection.
+#     #
+#     # This is a declaration, not an observation: if Oracle has gained a column
+#     # since it was written, this spec will not migrate it, and no error says so.
+#     # For a migration that will really run, extract a catalog instead -- the
+#     # catalog wins over this list anyway, so the two cannot disagree.
+#     # need_catalog.md has the full argument.
+#     columns:
+#       - { name: ORDER_ID,    type: "NUMBER(10)",      nullable: false }
+#       - { name: CUSTOMER_ID, type: "NUMBER(10)",      nullable: false }
+#       - { name: ORDER_DATE,  type: "DATE",            nullable: false }
+#       - { name: AMOUNT,      type: "NUMBER(12,2)" }
+#       - { name: STATUS,      type: "VARCHAR2(20)" }
+#     primaryKey: [ORDER_ID]

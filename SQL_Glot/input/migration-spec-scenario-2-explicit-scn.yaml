@@ -1,0 +1,105 @@
+specVersion: 1
+schemaVersion: 5.1.0
+dictionaryVersion: 1
+engines:
+  source:
+    engine: oracle
+    version: 26ai
+  target:
+    engine: postgresql
+    version: "17"
+scope:
+  include:
+    - objectClass: table
+      schema: banking
+      name: ACCOUNTS
+defaults:
+  emptyStringIsNull: "null"
+  charLengthSemantics: characters
+  collation: binary
+  numberWithoutPrecision: from-profile
+  dateWithTimeComponent: date-if-profile-proves-no-time
+  timestampWithTimeZone: split-offset
+  fractionalSecondsBeyondMicroseconds: round
+  json: jsonb
+acceptance:
+  checks:
+    - row-count-exact
+    - chunk-digest-match
+  maxQuarantinedRows: 0
+run:
+  shape: migration
+  acquisition: snapshot
+  processing: bounded
+  rerun: replace-scope
+naming:
+  schema:
+    policy: map
+    map:
+      - source: banking
+        target: public
+  case: lower
+  onReservedOrSpecial: quote
+  onTooLong: shorten-with-hash
+  packageMembers: prefix
+rules:
+  - id: accounts-table
+    match:
+      objectClass: table
+      schema: banking
+      name: ACCOUNTS
+    target:
+      schema: public
+      table: accounts
+    # The source table is explicitly declared here so the specification
+    # can compile without requiring an Oracle catalog.
+    #
+    # The declaration also defines the source shape expected by this rule.
+    # Any source column not listed here is intentionally excluded from
+    # migration. For a production migration, a catalog extraction should
+    # normally be supplied so the actual Oracle table shape can be verified.
+    #
+    # The conversion rules below demonstrate Oracle-to-PostgreSQL mappings
+    # for account identifiers, monetary values, dates, status codes, and
+    # boolean-like numeric flags.
+    columns:
+      - { name: ACCOUNT_ID,      type: "NUMBER(12)",       nullable: false }
+      - { name: CUSTOMER_ID,     type: "NUMBER(10)",       nullable: false }
+      - { name: ACCOUNT_TYPE,    type: "VARCHAR2(10)",     nullable: false }
+      - { name: BALANCE,         type: "NUMBER(15,2)" }
+      - { name: OPEN_DATE,       type: "DATE",             nullable: false }
+      - { name: STATUS,          type: "CHAR(1)",          nullable: false }
+      - { name: IS_ACTIVE,       type: "NUMBER(1)",        nullable: false }
+      - { name: BRANCH_CODE,     type: "VARCHAR2(20)" }
+    primaryKey: [ACCOUNT_ID]
+    conversions:
+      ACCOUNT_ID:
+        targetType: bigint
+      CUSTOMER_ID:
+        targetType: bigint
+      ACCOUNT_TYPE:
+        targetType: varchar(10)
+        transform: trim
+      BALANCE:
+        targetType: numeric(15,2)
+        transform: round
+      OPEN_DATE:
+        targetType: date
+      STATUS:
+        targetType: varchar(20)
+        transform:
+          map:
+            A: ACTIVE
+            C: CLOSED
+            S: SUSPENDED
+      IS_ACTIVE:
+        targetType: boolean
+        transform:
+          map:
+            1: true
+            0: false
+      BRANCH_CODE:
+        targetType: varchar(20)
+        transform: trim
+        nullIf:
+          - ""
