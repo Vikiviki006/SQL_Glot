@@ -1,0 +1,177 @@
+specVersion: 1
+schemaVersion: 5.1.0
+dictionaryVersion: 1
+
+engines:
+  source:
+    engine: oracle
+    version: 26ai
+  target:
+    engine: postgresql
+    version: "17"
+
+scope:
+  include:
+    - objectClass: table
+      schema: SPORTS
+      name: PRODUCTS
+    - objectClass: table
+      schema: SPORTS
+      name: CUSTOMERS
+    - objectClass: table
+      schema: SPORTS
+      name: ORDERS
+    - objectClass: table
+      schema: SPORTS
+      name: ORDER_ITEMS
+    - objectClass: table
+      schema: SPORTS
+      name: PAYMENTS
+    - objectClass: table
+      schema: SPORTS
+      name: INVENTORY
+
+defaults:
+  emptyStringIsNull: "null"
+  charLengthSemantics: characters
+  collation: binary
+  numberWithoutPrecision: from-profile
+  dateWithTimeComponent: date-if-profile-proves-no-time
+  timestampWithTimeZone: split-offset
+  fractionalSecondsBeyondMicroseconds: round
+  json: jsonb
+
+acceptance:
+  checks:
+    - row-count-exact
+    - chunk-digest-match
+  maxQuarantinedRows: 0
+
+run:
+  shape: migration
+  acquisition: snapshot
+  processing: bounded
+  rerun: replace-scope
+
+naming:
+  schema:
+    policy: map
+    map:
+      - source: SPORTS
+        target: public
+  case: lower
+  onReservedOrSpecial: quote
+  onTooLong: shorten-with-hash
+  packageMembers: prefix
+
+rules:
+
+  - id: products-table
+    match:
+      objectClass: table
+      schema: SPORTS
+      name: PRODUCTS
+    target:
+      schema: public
+      table: products
+    columns:
+      - { name: PRODUCT_ID,   type: "NUMBER(10)",    nullable: false }
+      - { name: PRODUCT_NAME, type: "VARCHAR2(100)", nullable: false }
+      - { name: CATEGORY_ID,  type: "NUMBER(10)",    nullable: false }
+      - { name: BRAND,        type: "VARCHAR2(50)" }
+      - { name: PRICE,        type: "NUMBER(12,2)",  nullable: false }
+      - { name: DESCRIPTION,  type: "VARCHAR2(500)" }
+      - { name: SIZE,         type: "VARCHAR2(20)" }
+      - { name: COLOR,        type: "VARCHAR2(30)" }
+      - { name: ACTIVE,       type: "NUMBER(1)",     nullable: false }
+      - { name: CREATED_AT,   type: "TIMESTAMP",     nullable: false }
+    primaryKey: [PRODUCT_ID]
+
+  - id: customers-table
+    match:
+      objectClass: table
+      schema: SPORTS
+      name: CUSTOMERS
+    target:
+      schema: public
+      table: customers
+    columns:
+      - { name: CUSTOMER_ID, type: "NUMBER(10)",    nullable: false }
+      - { name: FIRST_NAME,  type: "VARCHAR2(50)", nullable: false }
+      - { name: LAST_NAME,   type: "VARCHAR2(50)", nullable: false }
+      - { name: EMAIL,       type: "VARCHAR2(150)", nullable: false }
+      - { name: PHONE,       type: "VARCHAR2(20)" }
+      - { name: ADDRESS,     type: "VARCHAR2(250)" }
+      - { name: CITY,        type: "VARCHAR2(50)" }
+      - { name: STATE,       type: "VARCHAR2(50)" }
+      - { name: POSTAL_CODE, type: "VARCHAR2(15)" }
+      - { name: CREATED_AT,  type: "TIMESTAMP", nullable: false }
+    primaryKey: [CUSTOMER_ID]
+
+  - id: orders-table
+    match:
+      objectClass: table
+      schema: SPORTS
+      name: ORDERS
+    target:
+      schema: public
+      table: orders
+    columns:
+      - { name: ORDER_ID,    type: "NUMBER(10)",   nullable: false }
+      - { name: CUSTOMER_ID, type: "NUMBER(10)",   nullable: false }
+      - { name: ORDER_DATE,  type: "DATE",         nullable: false }
+      - { name: TOTAL_AMOUNT, type: "NUMBER(12,2)", nullable: false }
+      - { name: STATUS,      type: "VARCHAR2(20)", nullable: false }
+      - { name: SHIPPING_ADDRESS, type: "VARCHAR2(250)" }
+    primaryKey: [ORDER_ID]
+
+  - id: order-items-table
+    match:
+      objectClass: table
+      schema: SPORTS
+      name: ORDER_ITEMS
+    target:
+      schema: public
+      table: order_items
+    columns:
+      - { name: ORDER_ITEM_ID, type: "NUMBER(10)",  nullable: false }
+      - { name: ORDER_ID,      type: "NUMBER(10)",  nullable: false }
+      - { name: PRODUCT_ID,    type: "NUMBER(10)",  nullable: false }
+      - { name: QUANTITY,      type: "NUMBER(10)",  nullable: false }
+      - { name: UNIT_PRICE,    type: "NUMBER(12,2)", nullable: false }
+      - { name: DISCOUNT,      type: "NUMBER(5,2)" }
+    primaryKey: [ORDER_ITEM_ID]
+
+  - id: payments-table
+    match:
+      objectClass: table
+      schema: SPORTS
+      name: PAYMENTS
+    target:
+      schema: public
+      table: payments
+    columns:
+      - { name: PAYMENT_ID,   type: "NUMBER(10)",   nullable: false }
+      - { name: ORDER_ID,     type: "NUMBER(10)",   nullable: false }
+      - { name: PAYMENT_DATE, type: "TIMESTAMP",     nullable: false }
+      - { name: AMOUNT,       type: "NUMBER(12,2)",  nullable: false }
+      - { name: PAYMENT_METHOD, type: "VARCHAR2(30)", nullable: false }
+      - { name: PAYMENT_STATUS, type: "VARCHAR2(20)", nullable: false }
+      - { name: TRANSACTION_ID, type: "VARCHAR2(100)" }
+    primaryKey: [PAYMENT_ID]
+
+  - id: inventory-table
+    match:
+      objectClass: table
+      schema: SPORTS
+      name: INVENTORY
+    target:
+      schema: public
+      table: inventory
+    columns:
+      - { name: INVENTORY_ID, type: "NUMBER(10)", nullable: false }
+      - { name: PRODUCT_ID,   type: "NUMBER(10)", nullable: false }
+      - { name: STOCK_QTY,    type: "NUMBER(10)", nullable: false }
+      - { name: REORDER_LEVEL, type: "NUMBER(10)", nullable: false }
+      - { name: UPDATED_AT,   type: "TIMESTAMP", nullable: false }
+    primaryKey: [INVENTORY_ID]
